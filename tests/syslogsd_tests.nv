@@ -1,0 +1,159 @@
+// syslogsd_tests.nv — the API suite for structured data.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// syslog-nv.syslogsd.<fn>`.  What is asserted is RFC 5424 § 6.3.3's
+// escaping, both halves of it, and the rules § 6.3.2 puts on names.
+
+use std.test
+use syslogsd
+use syslogerror
+
+// The structured data of RFC 5424 § 6.5's third example message.
+fn example_three_element() -> SyslogSdElement
+    syslogsd.element("exampleSDID@32473",
+                     [syslogsd.param("iut", "3"),
+                      syslogsd.param("eventSource", "Application"),
+                      syslogsd.param("eventID", "1011")])
+
+@test
+fn test_the_three_characters_that_are_escaped_and_no_others() [io]
+    // RFC 5424 § 6.3.3 names exactly `"`, `\` and `]`.
+    test.case("a double quote, which would end the value")
+    test.assert(syslogsd.escape_param_value("say \"hi\"") == "say \\\"hi\\\"")
+
+    test.case("a backslash, which would otherwise be read as an escape")
+    test.assert(syslogsd.escape_param_value("a\\b") == "a\\\\b")
+
+    test.case("and the closing bracket, which is the one people forget")
+    // Unescaped, it ends the element early and everything after it is
+    // read as another element or as the message.
+    test.assert(syslogsd.escape_param_value("array[0]") == "array[0\\]")
+
+    test.case("an opening bracket is NOT escaped — § 6.3.3 names three")
+    test.assert(syslogsd.escape_param_value("[") == "[")
+
+    test.case("and neither is a newline or a tab")
+    test.assert(syslogsd.escape_param_value("a\nb") == "a\nb")
+
+@test
+fn test_a_backslash_before_anything_else_survives_unescaping() [io]
+    // The half of § 6.3.3 a general-purpose unescape routine gets
+    // wrong, and it corrupts every Windows path in every log it reads.
+    test.case("C:\\temp keeps its backslash")
+    test.assert(syslogsd.unescape_param_value("C:\\temp") == "C:\\temp")
+
+    test.case("the three real escapes are undone")
+    test.assert(syslogsd.unescape_param_value("a\\\"b") == "a\"b")
+    test.assert(syslogsd.unescape_param_value("a\\\\b") == "a\\b")
+    test.assert(syslogsd.unescape_param_value("a\\]b") == "a]b")
+
+    test.case("and escaping then unescaping is the identity")
+    let awkward = "]\\\" and a path C:\\temp"
+    test.assert(syslogsd.unescape_param_value(syslogsd.escape_param_value(awkward)) == awkward)
+
+@test
+fn test_an_sd_name_is_short_printable_and_missing_four_characters() [io]
+    // § 6.3.3: one to thirty-two printable US-ASCII characters, with
+    // `=`, space, `]` and `"` excluded.
+    test.case("the RFC's own SD-ID is one")
+    test.assert(syslogsd.is_valid_sd_name("exampleSDID@32473"))
+
+    test.case("a space is not allowed, because SD-PARAMs are space-separated")
+    test.assert(not syslogsd.is_valid_sd_name("has space"))
+
+    test.case("nor is an equals sign, a bracket or a quote")
+    test.assert(not syslogsd.is_valid_sd_name("a=b"))
+    test.assert(not syslogsd.is_valid_sd_name("a]b"))
+    test.assert(not syslogsd.is_valid_sd_name("a\"b"))
+
+    test.case("nor an empty name — the minimum is one character")
+    test.assert(not syslogsd.is_valid_sd_name(""))
+
+@test
+fn test_a_bare_sd_id_is_reserved_and_a_private_one_carries_a_number() [io]
+    // § 6.3.2: names without `@` belong to IANA; a private element is
+    // `name@<private enterprise number>`.
+    test.case("the three registered names")
+    test.assert(syslogsd.is_registered_sd_id("timeQuality"))
+    test.assert(syslogsd.is_registered_sd_id("origin"))
+    test.assert(syslogsd.is_registered_sd_id("meta"))
+
+    test.case("a name somebody invented is not one of them")
+    test.assert(not syslogsd.is_registered_sd_id("myThing"))
+
+    test.case("a private SD-ID carries its enterprise number")
+    match syslogsd.enterprise_number("exampleSDID@32473")
+        None    => test.fail("32473 is the number in the RFC's example")
+        Some(n) => test.assert(n == 32473)
+
+    test.case("and a name with no @ has none")
+    match syslogsd.enterprise_number("timeQuality")
+        Some(_) => test.fail("a registered name has no enterprise number")
+        None    => test.assert(true)
+
+    test.case("a whole field with an invented bare SD-ID is refused")
+    match syslogsd.check([syslogsd.element("myThing", [])])
+        None    => test.fail("a bare SD-ID must be one IANA registered")
+        Some(e) => test.assert(not syslogerror.is_framing_fault(e))
+
+@test
+fn test_the_same_sd_id_twice_is_refused_because_a_lookup_could_not_answer() [io]
+    // § 6.3.2 forbids it, and `element_of` is why it matters: with two
+    // elements of one name a lookup has two answers and no rule.
+    test.case("two `meta` elements are refused, naming the id")
+    let twice = [syslogsd.element("meta", []), syslogsd.element("meta", [])]
+    match syslogsd.check(twice)
+        None                         => test.fail("§ 6.3.2 forbids a repeated SD-ID")
+        Some(SyslogSdIdRepeated(id)) => test.assert(id == "meta")
+        Some(_)                      => test.fail("wrong reason for a repeated SD-ID")
+
+    test.case("one of each is fine")
+    let distinct = [syslogsd.element("meta", []), example_three_element()]
+    match syslogsd.check(distinct)
+        Some(_) => test.fail("two different SD-IDs are allowed")
+        None    => test.assert(true)
+
+    test.case("and a lookup finds the one it names")
+    match syslogsd.element_of(distinct, "exampleSDID@32473")
+        None     => test.fail("the field holds that element")
+        Some(el) => test.assert(list.len(el.params) == 3)
+
+@test
+fn test_values_come_back_the_way_the_sender_meant_them() [io]
+    test.case("a parameter is read by name")
+    match syslogsd.value_of(example_three_element(), "eventSource")
+        None    => test.fail("§ 6.5's third example carries eventSource")
+        Some(v) => test.assert(v == "Application")
+
+    test.case("a name that is not there is None")
+    match syslogsd.value_of(example_three_element(), "absent")
+        Some(_) => test.fail("that parameter is not in the element")
+        None    => test.assert(true)
+
+    test.case("values_of answers every one, in order")
+    test.assert(list.len(syslogsd.values_of(example_three_element(), "iut")) == 1)
+
+    test.case("and a field with nothing in it has no values")
+    test.assert(list.len(syslogsd.values_of(syslogsd.element("meta", []), "language")) == 0)
+
+@test
+fn test_an_empty_field_is_written_as_the_nilvalue_and_read_back_as_empty() [io]
+    // § 6.3: the STRUCTURED-DATA field is never omitted.  Absent is
+    // `-`, which is one octet, and a parser has to take it.
+    test.case("an empty list writes `-`")
+    match syslogsd.format([])
+        Err(_) => test.fail("an empty field is the NILVALUE and not an error")
+        Ok(s)  => test.assert(s == "-")
+
+    test.case("and `-` reads back as an empty list, one octet consumed")
+    let nil_field = [45 as u8]
+    match syslogsd.parse(nil_field)
+        Err(_)      => test.fail("`-` is the NILVALUE")
+        Ok((sd, n)) =>
+            test.assert(list.len(sd) == 0)
+            test.assert(n == 1)
+
+    test.case("a written element has the RFC's own spelling")
+    match syslogsd.format([syslogsd.element("meta", [syslogsd.param("language", "en")])])
+        Err(_) => test.fail("this field is well formed")
+        Ok(s)  => test.assert(s == "[meta language=\"en\"]")

@@ -1,0 +1,219 @@
+// syslogerror.nv — every way syslog octets can refuse to be read or
+// written, and the one division that changes what a receiver does next.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A FRAMING FAULT IS NOT A MESSAGE FAULT
+//
+// These two things look alike in a log and are not alike at all.
+//
+// A MESSAGE fault means one frame's contents are not valid syslog.  The
+// receiver already knows where that frame ended, because the framing
+// told it, so the next frame starts where it always would: the right
+// response is to count the message, keep the octets if anybody wants
+// them, and carry on.
+//
+// A FRAMING fault means the receiver no longer knows where the next
+// message begins.  Under the octet counting of RFC 6587 § 3.4.1 a
+// length that is not a length leaves the reader holding a stream it
+// cannot cut, and every "message" it produces from then on is a slice
+// of somebody else's.  There is no resynchronisation point in that
+// stream, so the only correct response is to stop reading and drop the
+// transport.
+//
+// A receiver that treated the two the same way either throws away a
+// whole connection over one malformed message, or keeps reading a
+// stream it has lost its place in and writes garbage into a log that
+// people make decisions from.  `is_framing_fault` is the one function
+// that separates them, and the reader's shape rests on it.
+//
+// WHY `at` IS COUNTED FROM THE START OF THE STREAM
+//
+// The offset in a fault is counted from the first octet the reader was
+// ever given, not from the start of the chunk that happened to contain
+// the fault.  A chunk boundary is an artefact of how the host read its
+// socket and it must not appear in a report a person reads.
+// `syslogframe.offset` is the same counter, so a caller can say "octet
+// 4,812 of this connection" without keeping a count of its own.
+
+// Why syslog octets could not be read, or could not be written.
+//
+// The names are the RFCs' subject matter rather than a parser's
+// internal states, so a caller can decide what to do from the variant
+// without reading the message.
+//
+// ```novo
+// use syslogerror
+//
+// fn main() [io]
+//     println(SyslogPriValueTooLarge(192).message())
+// ```
+pub enum SyslogError
+    // The message does not begin with `<`, or what follows is not a
+    // decimal number closed by `>` (RFC 5424 § 6.2.1, RFC 3164
+    // § 4.1.1).  Under RFC 3164 § 4.3.3 this is not fatal for a
+    // relay — `syslog3164.parse_relaxed` treats the whole message as
+    // content instead — which is why the strict parser has a variant
+    // and the relaxed one has no error channel at all.
+    SyslogBadPri(at: Int)
+    // The priority value is above 191, so it decomposes to a facility
+    // above 23.  RFC 5424 § 6.2.1 gives 24 facilities and 8
+    // severities, and 23 * 8 + 7 is 191.
+    SyslogPriValueTooLarge(prival: Int)
+    // The priority value is written with a leading zero, which RFC
+    // 5424 § 6.2.1 forbids: `<09>` is not another spelling of `<9>`.
+    SyslogPriHasLeadingZero(at: Int)
+    // The VERSION field after the priority is not `1`.  RFC 5424
+    // § 6.2.2 defines exactly one version, and this is what a caller
+    // that handed RFC 3164 octets to the RFC 5424 parser gets.
+    SyslogNotVersion1(found: Str)
+    // The timestamp does not match the format's grammar.  `why` names
+    // the part that failed, in the RFC's own words — `"FULL-DATE"`,
+    // `"TIME-OFFSET"`, `"month abbreviation"`.
+    SyslogBadTimestamp(at: Int, why: Str)
+    // The fractional seconds have more than six digits.  RFC 5424
+    // § 6.2.3.1 gives `2003-08-24T05:14:15.000000003-07:00` as an
+    // example that is NOT valid for exactly this reason.
+    SyslogTimestampTooPrecise(digits: Int)
+    // A timestamp is being written in a syntax that requires a part it
+    // does not carry.  `missing` is `"year"` or `"offset"`.  An RFC
+    // 3164 timestamp has neither (§ 4.1.2), so rendering one as RFC
+    // 3339 refuses until `syslogmsg.timestamp_resolved` has supplied
+    // them.
+    SyslogTimestampIncomplete(missing: Str)
+    // A header field is longer than RFC 5424 § 6.2 allows it to be.
+    // `field` is `"HOSTNAME"`, `"APP-NAME"`, `"PROCID"` or `"MSGID"`,
+    // and the two counts are octets rather than characters.
+    SyslogFieldTooLong(field: Str, octets: Int, max_octets: Int)
+    // A header field holds an octet outside PRINTUSASCII, which RFC
+    // 5424 § 6 defines as %d33 to %d126.  A space inside a field is
+    // the common case, and it is fatal because the space is what
+    // separates the fields.
+    SyslogFieldNotPrintable(field: Str, at: Int)
+    // A header field is empty.  RFC 5424 § 6.2 gives every one of them
+    // a minimum length of one, and the way to say "I do not have this"
+    // is the NILVALUE `-` and not an empty field.
+    SyslogFieldEmpty(field: Str)
+    // The structured data does not match RFC 5424 § 6.3's grammar.
+    // `why` names what was expected — `"]"`, `"= after PARAM-NAME"`,
+    // `"quoted PARAM-VALUE"`.
+    SyslogBadStructuredData(at: Int, why: Str)
+    // An SD-ID or a PARAM-NAME is not an SD-NAME: RFC 5424 § 6.3.3
+    // allows one to thirty-two printable US-ASCII characters and
+    // excludes `=`, space, `]` and `"`.
+    SyslogSdNameInvalid(name: Str)
+    // The same SD-ID appears twice in one message, which RFC 5424
+    // § 6.3.2 forbids.  It matters because a reader looking a value up
+    // by SD-ID would find one of two answers and no way to know which.
+    SyslogSdIdRepeated(id: Str)
+    // An SD-ID with no `@` in it is not one of the three RFC 5424
+    // § 6.3.2 registers.  A name without `@` is reserved by IANA, and
+    // a private one is written `name@<private enterprise number>`.
+    SyslogSdIdNotRegistered(id: Str)
+    // The RFC 3164 TAG is longer than the thirty-two alphanumeric
+    // characters § 4.1.3 allows.
+    SyslogBadTag(at: Int)
+    // The whole message is longer than the format allows: 1024 octets
+    // for RFC 3164 (§ 4.1).  A FRAMING fault, because the receiver
+    // that found it was cutting the stream at the time.
+    SyslogMessageTooLong(octets: Int, max_octets: Int)
+    // The MSG began with the byte order mark, so RFC 5424 § 6.4 says
+    // it is UTF-8, and the octets after it are not.  The message is
+    // still delivered as octets; this is what `syslogmsg.msg_text`
+    // answering `None` means when a caller asks why.
+    SyslogMsgNotUtf8(at: Int)
+    // The MSG-LEN of an octet-counted frame is not a length: it is
+    // empty, it begins with `0`, or no space follows it.  RFC 6587
+    // § 3.4.1 writes it as a non-zero digit followed by digits and
+    // then one space.  A FRAMING fault.
+    SyslogBadFrameLength(at: Int)
+    // An octet-counted frame declares more octets than the reader was
+    // told it may hold.  A FRAMING fault, and the reason the limit
+    // exists: a four-digit length costs four octets to send and a
+    // ten-digit one costs ten, so an unbounded reader is a denial of
+    // service that costs the sender nothing.
+    SyslogFrameTooLarge(octets: Int, max_octets: Int)
+    // The stream ended part-way through an octet-counted frame.  A
+    // FRAMING fault: the declared length said how much was coming and
+    // it did not come, so what arrived is a prefix of a message and
+    // not a short message.
+    SyslogFrameTruncated(at: Int)
+    // A message being written with non-transparent framing contains
+    // the trailer octet.  RFC 6587 § 3.4.2 has no escape for it, so a
+    // sender that wrote it anyway would split its own message in two
+    // and the receiver would see two malformed ones.  A FRAMING
+    // fault, and the reason octet counting exists.
+    SyslogTrailerInMessage(at: Int)
+
+// `SyslogError` is an `Error`, which is what lets
+// `Result<T, SyslogError>` exist at all (SPEC § 3.4).
+impl Error for SyslogError
+    // The one-line message, for a log.
+    //
+    // It says what was found and what was expected, in the RFCs'
+    // words, and names the octet where a positional fault was found.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("syslog-nv.SyslogError.message")
+
+// Whether this fault means the receiver has lost its place in the
+// stream.
+//
+// True for `SyslogBadFrameLength`, `SyslogFrameTooLarge`,
+// `SyslogFrameTruncated`, `SyslogTrailerInMessage` and
+// `SyslogMessageTooLong`.  Those five happened while the reader was
+// cutting the stream into messages, so the next message's first octet
+// is no longer known, and under octet counting there is nothing in the
+// stream to resynchronise on.  A receiver that meets one closes the
+// transport.
+//
+// False for everything else.  Those faults are about the contents of
+// one frame whose boundaries the framing already settled, so the
+// receiver reports the message and reads the next one.
+//
+// ```novo
+// use syslogerror
+//
+// fn main() [io]
+//     let wrong_version = SyslogNotVersion1("0")
+//     println("${syslogerror.is_framing_fault(SyslogFrameTruncated(10))}")  // true
+//     println("${syslogerror.is_framing_fault(wrong_version)}")             // false
+// ```
+pub fn is_framing_fault(e: SyslogError) -> Bool
+    todo("syslog-nv.syslogerror.is_framing_fault")
+
+// The octet this fault was found at, counted from the first octet the
+// reader was ever given, or `-1`.
+//
+// `-1` is the answer for the faults that are not positional: a field
+// that is too long, a repeated SD-ID, a timestamp missing its year.
+// Those describe a value rather than a place, and a caller printing
+// "octet -1" has been told to print something else instead.
+//
+// ```novo
+// use syslogerror
+//
+// fn main() [io]
+//     println("${syslogerror.offset_of(SyslogBadPri(0))}")                   // 0
+//     println("${syslogerror.offset_of(SyslogPriValueTooLarge(200))}")       // -1
+// ```
+pub fn offset_of(e: SyslogError) -> Int
+    todo("syslog-nv.syslogerror.offset_of")
+
+// A short stable code for metrics and logs: `"bad_pri"`,
+// `"frame_truncated"`, `"sd_id_repeated"`, and so on.
+//
+// Stable across releases and free of anything the octets carried, so
+// it is safe as a metric label.  Putting `e.message()` in one would
+// put a sender-chosen hostname into a time series database, which is a
+// cardinality explosion and an injection at the same time.
+//
+// ```novo
+// use syslogerror
+//
+// fn main() [io]
+//     println(syslogerror.code(SyslogFrameTruncated(4812)))     // frame_truncated
+// ```
+pub fn code(e: SyslogError) -> Str
+    todo("syslog-nv.syslogerror.code")

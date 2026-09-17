@@ -1,0 +1,289 @@
+// syslog3164.nv — the BSD format, read and written.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT RFC 3164 IS
+//
+// RFC 3164 does not specify syslog.  It was written in 2001 to write
+// down what implementations were already doing, and it says so: it is
+// an observation of the protocol as it was found on the wire.  That is
+// why it is full of "has been seen to be" and "most commonly", and it
+// is why a parser for it cannot be a grammar and nothing else.
+//
+// A message is a priority, then `Mmm dd hh:mm:ss`, then a hostname,
+// then the content:
+//
+//     <34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8
+//
+// § 4.1 caps the whole thing at 1024 octets.
+//
+// TWO PARSERS, BECAUSE THERE ARE TWO JOBS
+//
+// `parse` reads § 4.1's grammar and refuses what does not match.  It is
+// for a sender's own round trip and for a receiver that wants to count
+// how many of its senders are conforming.
+//
+// `parse_relaxed` cannot fail.  It has no error channel at all, and
+// that is § 4.3.3 taken literally: a relay that receives a packet with
+// no valid priority must not drop it — it must insert a priority of 13
+// and treat THE WHOLE PACKET as the content.  A collector that refused
+// those messages would be discarding exactly the traffic that is worth
+// looking at, because the senders that get the format wrong are the
+// ones nobody is watching.  So the relaxed parser always answers a
+// message: what it could read, it read, and what it could not, it put
+// in the content.
+//
+// A collector uses `parse_relaxed`.  A conformance test uses `parse`.
+// Offering only one of them would have meant either throwing real
+// traffic away or having no way to tell a good message from a repaired
+// one.
+//
+// THE TIMESTAMP IS WHERE THE INFORMATION IS LOST
+//
+// `Mmm dd hh:mm:ss` has no year, no zone and no fraction, and it is in
+// the sender's local time.  Nothing in the message says what that time
+// zone is.  The information is not recoverable from the message and
+// this package does not pretend otherwise: a parsed timestamp carries
+// `None` for its year and `None` for its offset, and
+// `syslogmsg.timestamp_resolved` is where a caller that knows supplies
+// them.
+//
+// The other trap in that syntax is the day.  § 4.1.2 says that if the
+// day of the month is less than 10 it is written with a LEADING SPACE
+// and not a leading zero, so the first of January is `Jan  1` with two
+// spaces in it.  A sender that writes `Jan 01` has written something
+// receivers reject, and a parser that splits the header on whitespace
+// gets a different number of fields on nine days of every month.
+// `format_timestamp` writes the space and `parse_timestamp` expects it.
+
+use syslogmsg
+use syslogpri
+use syslogerror
+
+// One whole RFC 3164 message, parsed strictly.
+//
+// Refuses what § 4.1 does not allow: a missing or malformed priority,
+// a timestamp that is not `Mmm dd hh:mm:ss`, a TAG longer than the 32
+// alphanumeric characters § 4.1.3 allows, and a message over 1024
+// octets.  The timestamp comes back with no year and no offset.
+//
+// The message that comes back has `format` set to
+// `SyslogFormatRfc3164`, an empty `msgid` and no structured data,
+// because RFC 3164 has neither field.
+//
+// ```novo
+// use syslog3164
+// use syslogmsg
+//
+// fn main() [io]
+//     let wire = bytes.to_byte_list(bytes.from_str("<34>Oct 11 22:14:15 mymachine su: failed"))
+//     match syslog3164.parse(wire)
+//         Ok(m)  => println(m.app_name)      // su
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(octets: [u8]) -> Result<SyslogMessage, SyslogError>
+    todo("syslog-nv.syslog3164.parse")
+
+// One RFC 3164 message, parsed the way a relay has to parse one.
+//
+// It cannot fail, because § 4.3.3 says a relay meeting a packet with
+// no valid priority inserts a priority and treats the whole packet as
+// the content rather than dropping it.  `default_pri` is that priority
+// — pass `syslog3164.default_pri()` for the `<13>` the section names,
+// or another one if a deployment has decided differently.
+//
+// What it does, in order: read a priority if there is one and use
+// `default_pri` if there is not; read a timestamp if there is one and
+// leave `timestamp` as `None` if there is not; read a hostname and a
+// TAG if they are there.  Everything it could not read stays in the
+// content, in the octets it arrived as.  Nothing is invented, and the
+// absent fields are absent rather than filled in with the receiver's
+// own name and clock — § 4.3.2 asks a RELAY to fill those in, and a
+// relay does it deliberately, not as a side effect of parsing.
+//
+// ```novo
+// use syslog3164
+// use syslogmsg
+//
+// fn main() [io]
+//     // Not a syslog message at all — a bare line from some daemon.
+//     let junk = bytes.to_byte_list(bytes.from_str("something went wrong"))
+//     let m = syslog3164.parse_relaxed(junk, syslog3164.default_pri())
+//     println("${list.len(m.msg)} octets of content")
+// ```
+pub fn parse_relaxed(octets: [u8], default_pri: SyslogPri) -> SyslogMessage
+    todo("syslog-nv.syslog3164.parse_relaxed")
+
+// One whole RFC 3164 message, written.
+//
+// Writes the priority, the timestamp, the hostname, then the
+// application name, then `[procid]` if there is one, then `: `, then
+// the content.
+//
+// THE FIELDS RFC 3164 DOES NOT HAVE ARE DROPPED, NOT ENCODED
+// SOMEWHERE ELSE.  A message carrying a MSGID or structured data loses
+// them here, silently, because there is nowhere in this format to put
+// them and folding them into the content would produce a message that
+// says something the sender did not write.  A program that needs them
+// to survive is writing RFC 5424.
+//
+// Refuses a message over the 1024 octets § 4.1 allows, a TAG that is
+// not alphanumeric, and a timestamp that has a year and an offset it
+// cannot write — it writes neither, so nothing is lost by refusing,
+// but the caller is told rather than left to find out.
+//
+// ```novo
+// use syslog3164
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.with_app_name(
+//                 syslogmsg.message(syslogpri.pri(SyslogFacAuth, SyslogSevCritical)),
+//                 "su")
+//     match syslog3164.format(m)
+//         Ok(octets) => println("${list.len(octets)} octets")
+//         Err(e)     => println(e.message())
+// ```
+pub fn format(m: SyslogMessage) -> Result<[u8], SyslogError>
+    todo("syslog-nv.syslog3164.format")
+
+// The priority RFC 3164 § 4.3.3 tells a relay to use for a packet that
+// has none: 13, which is facility 1 and severity 5 — user-level
+// messages, Notice.
+//
+// It is a function rather than a constant a caller types, so that the
+// number and the section it comes from live in one place.
+//
+// ```novo
+// use syslog3164
+// use syslogpri
+//
+// fn main() [io]
+//     println("${syslogpri.prival(syslog3164.default_pri())}")     // 13
+// ```
+pub fn default_pri() -> SyslogPri
+    todo("syslog-nv.syslog3164.default_pri")
+
+// The TAG at the start of some content, and the content after it.
+//
+// § 4.1.3's rule and only that rule: the TAG is the leading run of
+// alphanumeric characters, at most 32 of them, and the FIRST
+// non-alphanumeric character ends it and is the first character of the
+// content.  So `su: failed` splits into `su` and `: failed`, with the
+// colon kept — the RFC says that character belongs to the content, and
+// a splitter that ate it would change what the sender wrote.
+//
+// `parse` does one thing more than this, and it is a convention rather
+// than the RFC: content that begins `[` digits `]` has that number
+// lifted into `procid`, because `su[1234]:` is what nearly every
+// sender writes and a collector that left it in the text could not
+// group a process's messages.  This function does not do it, so a
+// caller that wants § 4.1.3 exactly has it.
+//
+// ```novo
+// use syslog3164
+//
+// fn main() [io]
+//     let content = bytes.to_byte_list(bytes.from_str("su: 'su root' failed"))
+//     let (tag, rest) = syslog3164.split_tag(content)
+//     println(tag)                       // su
+//     println("${list.len(rest)}")       // the colon is still there
+// ```
+pub fn split_tag(content: [u8]) -> (Str, [u8])
+    todo("syslog-nv.syslog3164.split_tag")
+
+// An RFC 3164 TIMESTAMP, parsed.
+//
+// `Mmm dd hh:mm:ss`, where `Mmm` is one of the twelve abbreviations in
+// `month_abbreviations` and `dd` is space-padded below 10 (§ 4.1.2).
+// The result has `None` for its year and `None` for its offset,
+// because the syntax carries neither.
+//
+// A day written `01` rather than ` 1` is `SyslogBadTimestamp`.  That
+// looks harsh for something a receiver could obviously understand, and
+// it is deliberate: accepting both spellings means the field is
+// sometimes two characters and sometimes three, and every parser
+// downstream that split the header on spaces gets a different answer
+// for nine days of each month.
+//
+// ```novo
+// use syslog3164
+//
+// fn main() [io]
+//     match syslog3164.parse_timestamp("Oct 11 22:14:15")
+//         Ok(t)  => println("${t.day}")      // 11
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_timestamp(text: Str) -> Result<SyslogTimestamp, SyslogError>
+    todo("syslog-nv.syslog3164.parse_timestamp")
+
+// A timestamp written the way § 4.1.2 writes one.
+//
+// The day is space-padded below 10, so the first of January is
+// `Jan  1 00:00:00` with two spaces.  The year, the offset and the
+// fractional second are DROPPED, because this syntax has nowhere to
+// put them — which is the reason a message that went out in RFC 3164
+// cannot be turned back into the instant it named.
+//
+// ```novo
+// use syslog3164
+// use syslogmsg
+//
+// fn main() [io]
+//     match syslogmsg.timestamp(Some(2003), 1, 1, 0, 0, 0, 0, Some(0))
+//         Ok(t)  =>
+//             match syslog3164.format_timestamp(t)
+//                 Ok(s)   => println(s)              // Jan  1 00:00:00
+//                 Err(e2) => println(e2.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn format_timestamp(t: SyslogTimestamp) -> Result<Str, SyslogError>
+    todo("syslog-nv.syslog3164.format_timestamp")
+
+// The twelve month abbreviations § 4.1.2 allows, in calendar order:
+// `Jan`, `Feb`, `Mar`, `Apr`, `May`, `Jun`, `Jul`, `Aug`, `Sep`,
+// `Oct`, `Nov`, `Dec`.
+//
+// These exact spellings and no others.  They are English and they are
+// not affected by anything a host is configured to do, which is worth
+// saying because a sender that formatted its month through a
+// locale-aware library sends `mai` or `окт` and no receiver in the
+// world reads it.
+//
+// ```novo
+// use syslog3164
+//
+// fn main() [io]
+//     println("${list.len(syslog3164.month_abbreviations())}")     // 12
+// ```
+pub fn month_abbreviations() -> [Str]
+    todo("syslog-nv.syslog3164.month_abbreviations")
+
+// The 1024 octets § 4.1 gives a whole RFC 3164 message.
+//
+// Unlike RFC 5424's two sizes this one is a limit and not advice: the
+// section says a message must not exceed it, `format` refuses to write
+// a longer one, and `parse` refuses to read one.
+//
+// ```novo
+// use syslog3164
+//
+// fn main() [io]
+//     println("${syslog3164.max_message_octets()}")     // 1024
+// ```
+pub fn max_message_octets() -> Int
+    todo("syslog-nv.syslog3164.max_message_octets")
+
+// The 32 characters § 4.1.3 gives the TAG.
+//
+// ```novo
+// use syslog3164
+// use syslogerror
+//
+// fn main() [io]
+//     println("${syslog3164.max_tag_chars()}")          // 32
+//     println(syslogerror.code(SyslogBadTag(24)))       // bad_tag
+// ```
+pub fn max_tag_chars() -> Int
+    todo("syslog-nv.syslog3164.max_tag_chars")

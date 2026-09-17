@@ -1,0 +1,377 @@
+// syslogpri.nv — the priority, taken apart into the two things it is.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT A PRIORITY IS
+//
+// Both syslog formats begin with a priority: a `<`, a decimal number,
+// a `>`.  The number is not a scale.  RFC 5424 § 6.2.1 says it is a
+// facility multiplied by eight plus a severity, so `<165>` is facility
+// 20 and severity 5, and the two halves have nothing to do with each
+// other: the facility says which part of a system spoke and the
+// severity says how loudly.
+//
+// A library that published the number and left the arithmetic to the
+// caller would be publishing the bug: `prival / 8` and `prival % 8`
+// are easy to write and easy to write the wrong way round, and a
+// filter built on the wrong one drops mail because it thought it was
+// dropping debug.  So a `SyslogPri` is the pair, the arithmetic
+// happens once, here, and `from_prival` is the only way in from a
+// number.
+//
+// A LOWER SEVERITY NUMBER IS MORE SEVERE
+//
+// The severity numbers run from 0 for Emergency to 7 for Debug (RFC
+// 5424 § 6.2.1, Table 2), so the comparison everybody wants — "at
+// least as severe as Warning" — is `<=` on the numbers and reads
+// backwards to everyone who has not just read the table.  It is the
+// single most common mistake made with a syslog priority, it inverts
+// exactly the filter that was supposed to catch the emergencies, and
+// it produces a system that looks like it is working: a `>=` filter
+// set to Warning passes Notice, Informational and Debug and drops
+// Emergency, Alert, Critical and Error.  `is_at_least_as_severe` is
+// that comparison written once with a name that cannot be read
+// backwards.
+//
+// THERE IS NO NAME-TO-FACILITY FUNCTION, AND THAT IS NOT AN OMISSION
+//
+// RFC 5424's Table 1 is not a list of unique names.  Facilities 4 and
+// 10 are both described as security and authorization messages, and
+// facilities 9 and 15 are both described as the clock daemon; the
+// table's own notes say so.  The short keywords people type in a
+// configuration file — `auth`, `authpriv`, `cron` — are a convention
+// of one implementation's configuration language and are not in any of
+// these RFCs, and they disagree between systems: the constant a C
+// program calls `LOG_CRON` is facility 9 on Linux and facility 15 on
+// several BSD systems.
+//
+// So `facility_description` answers Table 1's own words, and there is
+// no function that takes a word and answers a facility.  A program
+// that needs one is choosing a policy, and it writes the table it
+// means.  Severities are different — Table 2's eight names are
+// distinct and normative — so `severity_from_name` exists.
+
+use syslogerror
+
+// Which part of a system a message came from.
+//
+// The twenty-four facilities of RFC 5424 § 6.2.1, Table 1, in their
+// numeric order.  `SyslogFacLocal0` to `SyslogFacLocal7` are facilities
+// 16 to 23, which the table reserves for local use and which is where
+// most application logging actually goes.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println("${syslogpri.facility_number(SyslogFacLocal0)}")   // 16
+// ```
+pub enum SyslogFacility
+    // 0 — kernel messages.
+    SyslogFacKern
+    // 1 — user-level messages, and the default for a program that has
+    // not chosen.
+    SyslogFacUser
+    // 2 — the mail system.
+    SyslogFacMail
+    // 3 — system daemons.
+    SyslogFacDaemon
+    // 4 — security and authorization messages.  Table 1's note says
+    // several systems use 4, 10, 13 and 14 for things that all look
+    // like this one.
+    SyslogFacAuth
+    // 5 — messages generated internally by the syslog daemon.
+    SyslogFacSyslog
+    // 6 — the line printer subsystem.
+    SyslogFacLpr
+    // 7 — the network news subsystem.
+    SyslogFacNews
+    // 8 — the UUCP subsystem.
+    SyslogFacUucp
+    // 9 — the clock daemon.  Table 1's note says several systems use
+    // both 9 and 15 for this, which is why there are two arms and no
+    // way to ask for "the clock one" by name.
+    SyslogFacCron
+    // 10 — security and authorization messages, the private kind.
+    SyslogFacAuthPriv
+    // 11 — the FTP daemon.
+    SyslogFacFtp
+    // 12 — the NTP subsystem.
+    SyslogFacNtp
+    // 13 — log audit.
+    SyslogFacAudit
+    // 14 — log alert.
+    SyslogFacAlert
+    // 15 — the clock daemon again.  The second of the pair; see
+    // `SyslogFacCron`.
+    SyslogFacCron2
+    // 16 — local use 0.
+    SyslogFacLocal0
+    // 17 — local use 1.
+    SyslogFacLocal1
+    // 18 — local use 2.
+    SyslogFacLocal2
+    // 19 — local use 3.
+    SyslogFacLocal3
+    // 20 — local use 4.
+    SyslogFacLocal4
+    // 21 — local use 5.
+    SyslogFacLocal5
+    // 22 — local use 6.
+    SyslogFacLocal6
+    // 23 — local use 7.
+    SyslogFacLocal7
+
+// How severe a message is.
+//
+// The eight severities of RFC 5424 § 6.2.1, Table 2, in their numeric
+// order — which runs from most severe to least.  The names are the
+// table's own.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println("${syslogpri.severity_number(SyslogSevEmergency)}")   // 0
+//     println("${syslogpri.severity_number(SyslogSevDebug)}")       // 7
+// ```
+pub enum SyslogSeverity
+    // 0 — system is unusable.
+    SyslogSevEmergency
+    // 1 — action must be taken immediately.
+    SyslogSevAlert
+    // 2 — critical conditions.
+    SyslogSevCritical
+    // 3 — error conditions.
+    SyslogSevError
+    // 4 — warning conditions.
+    SyslogSevWarning
+    // 5 — normal but significant condition.
+    SyslogSevNotice
+    // 6 — informational messages.
+    SyslogSevInformational
+    // 7 — debug-level messages.
+    SyslogSevDebug
+
+// A facility and a severity, which is what a priority is.
+//
+// Both formats carry the pair encoded as one number; this is the pair.
+// `prival` goes back to the number and `from_prival` comes from it.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     let p = syslogpri.pri(SyslogFacLocal4, SyslogSevNotice)
+//     println("${syslogpri.prival(p)}")     // 165
+// ```
+pub struct SyslogPri
+    // Which part of the system spoke.
+    facility: SyslogFacility
+    // How loudly.  Remember that a lower number is more severe;
+    // `is_at_least_as_severe` is the comparison to use.
+    severity: SyslogSeverity
+
+// The priority made of a facility and a severity.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     let p = syslogpri.pri(SyslogFacMail, SyslogSevCritical)
+//     println("${syslogpri.prival(p)}")     // 18
+// ```
+pub fn pri(facility: SyslogFacility, severity: SyslogSeverity) -> SyslogPri
+    todo("syslog-nv.syslogpri.pri")
+
+// The priority value a priority encodes to: facility times eight plus
+// severity (RFC 5424 § 6.2.1).
+//
+// Always between 0 and 191, because there are twenty-four facilities
+// and eight severities.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println("${syslogpri.prival(syslogpri.pri(SyslogFacKern, SyslogSevEmergency))}")   // 0
+// ```
+pub fn prival(p: SyslogPri) -> Int
+    todo("syslog-nv.syslogpri.prival")
+
+// The priority a priority value encodes, or a refusal.
+//
+// `SyslogPriValueTooLarge` above 191 and for a negative number.  This
+// is the only way to build a `SyslogPri` from a number, so the
+// division and the remainder happen once rather than at every call
+// site that thought it knew which was which.
+//
+// ```novo
+// use syslogpri
+// use syslogerror
+//
+// fn main() [io]
+//     match syslogpri.from_prival(165)
+//         Ok(p)  => println("${syslogpri.facility_number(p.facility)}")   // 20
+//         Err(e) => println(syslogerror.code(e))
+// ```
+pub fn from_prival(prival: Int) -> Result<SyslogPri, SyslogError>
+    todo("syslog-nv.syslogpri.from_prival")
+
+// The number a facility has in RFC 5424 § 6.2.1, Table 1: 0 to 23.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println("${syslogpri.facility_number(SyslogFacDaemon)}")   // 3
+// ```
+pub fn facility_number(f: SyslogFacility) -> Int
+    todo("syslog-nv.syslogpri.facility_number")
+
+// The number a severity has in RFC 5424 § 6.2.1, Table 2: 0 to 7.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println("${syslogpri.severity_number(SyslogSevWarning)}")   // 4
+// ```
+pub fn severity_number(s: SyslogSeverity) -> Int
+    todo("syslog-nv.syslogpri.severity_number")
+
+// The facility a number denotes, or a refusal above 23.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     match syslogpri.facility_from_number(24)
+//         Ok(_)  => println("there is no facility 24")
+//         Err(e) => println(e.message())
+// ```
+pub fn facility_from_number(n: Int) -> Result<SyslogFacility, SyslogError>
+    todo("syslog-nv.syslogpri.facility_from_number")
+
+// The severity a number denotes, or a refusal above 7.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     match syslogpri.severity_from_number(3)
+//         Ok(s)  => println(syslogpri.severity_name(s))   // Error
+//         Err(e) => println(e.message())
+// ```
+pub fn severity_from_number(n: Int) -> Result<SyslogSeverity, SyslogError>
+    todo("syslog-nv.syslogpri.severity_from_number")
+
+// What RFC 5424 § 6.2.1, Table 1 calls this facility.
+//
+// Table 1's own words — `"kernel messages"`, `"clock daemon"`,
+// `"local use 4"` — and therefore NOT a unique key: facilities 4 and
+// 10 share a description and so do 9 and 15.  Use it to label a
+// facility for a person to read, and never to look one up.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println(syslogpri.facility_description(SyslogFacKern))    // kernel messages
+// ```
+pub fn facility_description(f: SyslogFacility) -> Str
+    todo("syslog-nv.syslogpri.facility_description")
+
+// What RFC 5424 § 6.2.1, Table 2 calls this severity.
+//
+// `"Emergency"`, `"Alert"`, `"Critical"`, `"Error"`, `"Warning"`,
+// `"Notice"`, `"Informational"`, `"Debug"`.  These eight ARE distinct,
+// which is why `severity_from_name` exists and no facility equivalent
+// does.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println(syslogpri.severity_name(SyslogSevNotice))         // Notice
+// ```
+pub fn severity_name(s: SyslogSeverity) -> Str
+    todo("syslog-nv.syslogpri.severity_name")
+
+// The severity a name denotes, ignoring case, or `None`.
+//
+// Takes Table 2's names.  A configuration file that says
+// `level = "warning"` is the caller this exists for, and answering
+// `None` rather than a default is deliberate: a service that silently
+// treated an unrecognised level as Debug would log everything, and a
+// service that treated it as Emergency would log nothing.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     match syslogpri.severity_from_name("warning")
+//         Some(s) => println("${syslogpri.severity_number(s)}")   // 4
+//         None    => println("not a severity name")
+// ```
+pub fn severity_from_name(name: Str) -> ?SyslogSeverity
+    todo("syslog-nv.syslogpri.severity_from_name")
+
+// Whether `a` is at least as severe as `b`.
+//
+// True when `a`'s number is less than or equal to `b`'s, because RFC
+// 5424 § 6.2.1, Table 2 numbers Emergency 0 and Debug 7.  This is the
+// function a level filter is built from, and it exists because the
+// comparison written by hand is written backwards about half the time
+// — which produces a filter that passes Debug and drops Emergency and
+// looks, from the outside, like a working filter.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     // Error is more severe than Warning, so an "at Warning and
+//     // above" filter passes it.
+//     println("${syslogpri.is_at_least_as_severe(SyslogSevError, SyslogSevWarning)}")   // true
+//     println("${syslogpri.is_at_least_as_severe(SyslogSevDebug, SyslogSevWarning)}")   // false
+// ```
+pub fn is_at_least_as_severe(a: SyslogSeverity, b: SyslogSeverity) -> Bool
+    todo("syslog-nv.syslogpri.is_at_least_as_severe")
+
+// The priority at the start of some octets, and how many octets it
+// took.
+//
+// Reads `<` DIGITS `>` and nothing else, so it works on both formats:
+// the PRI is the one part RFC 3164 § 4.1.1 and RFC 5424 § 6.2.1 spell
+// the same way.  A leading zero is `SyslogPriHasLeadingZero` rather
+// than a number, because RFC 5424 § 6.2.1 says the value must not have
+// one and a receiver that accepted `<09>` accepts two spellings of one
+// priority.
+//
+// The count that comes back is the octets consumed, which is where the
+// rest of the message starts.
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     let octets = [60 as u8, 51 as u8, 52 as u8, 62 as u8]     // <34>
+//     match syslogpri.parse_pri(octets)
+//         Ok((p, n)) => println("${syslogpri.prival(p)} in ${n} octets")
+//         Err(e)     => println(e.message())
+// ```
+pub fn parse_pri(octets: [u8]) -> Result<(SyslogPri, Int), SyslogError>
+    todo("syslog-nv.syslogpri.parse_pri")
+
+// A priority written the way both formats begin: `<`, the value, `>`.
+//
+// No leading zero, so `<9>` and never `<09>` (RFC 5424 § 6.2.1).
+//
+// ```novo
+// use syslogpri
+//
+// fn main() [io]
+//     println(syslogpri.format_pri(syslogpri.pri(SyslogFacAuth, SyslogSevNotice)))   // <37>
+// ```
+pub fn format_pri(p: SyslogPri) -> Str
+    todo("syslog-nv.syslogpri.format_pri")

@@ -1,0 +1,184 @@
+// syslogcover_tests.nv — the message value, and the rest of the public
+// surface with one case each.
+//
+// RED ON PURPOSE, like every suite here: each assertion reaches `not
+// implemented: syslog-nv.<module>.<fn>`.
+//
+// The four suites beside this one assert the two formats, the
+// structured data and the framing.  This one asserts the value they all
+// produce, and exists so that no public function ships without a
+// written expectation of what it answers.
+
+use std.test
+use syslogmsg
+use syslogpri
+use syslogsd
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+fn a_message() -> SyslogMessage
+    syslogmsg.message(syslogpri.pri(SyslogFacLocal4, SyslogSevNotice))
+
+@test
+fn test_a_fresh_message_has_a_priority_and_nothing_else() [io]
+    // Every field absent rather than defaulted: the NILVALUE RFC 5424
+    // § 6.2.4 gives a sender with nothing to say is `-`, and not a
+    // made-up hostname.
+    test.case("the priority is what was asked for")
+    let m = a_message()
+    test.assert(syslogpri.prival(m.pri) == 165)
+
+    test.case("and every other field is empty")
+    test.assert(m.hostname == "")
+    test.assert(m.app_name == "")
+    test.assert(m.procid == "")
+    test.assert(m.msgid == "")
+    test.assert(list.len(m.structured_data) == 0)
+    test.assert(list.len(m.msg) == 0)
+
+    test.case("with no timestamp at all, because this package has no clock")
+    match m.timestamp
+        Some(_) => test.fail("nothing has supplied one")
+        None    => test.assert(true)
+
+    test.case("and the NILVALUE those empty fields are written as is `-`")
+    test.assert(syslogmsg.nilvalue() == "-")
+
+@test
+fn test_every_builder_sets_the_one_field_it_names() [io]
+    test.case("the five text fields")
+    test.assert(syslogmsg.with_hostname(a_message(), "mymachine").hostname == "mymachine")
+    test.assert(syslogmsg.with_app_name(a_message(), "evntslog").app_name == "evntslog")
+    test.assert(syslogmsg.with_procid(a_message(), "8710").procid == "8710")
+    test.assert(syslogmsg.with_msgid(a_message(), "ID47").msgid == "ID47")
+
+    test.case("the structured data")
+    let sd = [syslogsd.element("meta", [syslogsd.param("language", "en")])]
+    let with_sd = syslogmsg.with_structured_data(a_message(), sd)
+    test.assert(list.len(with_sd.structured_data) == 1)
+
+    test.case("and the timestamp")
+    match syslogmsg.timestamp(Some(2003), 10, 11, 22, 14, 15, 3000, Some(0))
+        Err(_) => test.fail("that is a valid reading")
+        Ok(t)  =>
+            match syslogmsg.with_timestamp(a_message(), t).timestamp
+                None      => test.fail("with_timestamp just set one")
+                Some(set) => test.assert(set.micros == 3000)
+
+@test
+fn test_a_timestamp_is_refused_when_its_parts_are_not_a_time() [io]
+    test.case("a month of 13")
+    match syslogmsg.timestamp(Some(2003), 13, 1, 0, 0, 0, 0, Some(0))
+        Ok(_)  => test.fail("there are twelve months")
+        Err(e) => test.assert(not syslogerror.is_framing_fault(e))
+
+    test.case("an hour of 24")
+    match syslogmsg.timestamp(Some(2003), 1, 1, 24, 0, 0, 0, Some(0))
+        Ok(_)  => test.fail("the hour runs 0 to 23")
+        Err(e) => test.assert(syslogerror.code(e) == "bad_timestamp")
+
+    test.case("a second of 60, because RFC 5424 § 6.2.3 forbids leap seconds")
+    match syslogmsg.timestamp(Some(2003), 1, 1, 0, 0, 60, 0, Some(0))
+        Ok(_)  => test.fail("§ 6.2.3 says leap seconds must not be used")
+        Err(_) => test.assert(true)
+
+    test.case("and a fraction finer than six digits")
+    match syslogmsg.timestamp(Some(2003), 1, 1, 0, 0, 0, 1000000, Some(0))
+        Ok(_)                                  => test.fail("§ 6.2.3.1 caps it at six digits")
+        Err(SyslogTimestampTooPrecise(digits)) => test.assert(digits > 6)
+        Err(_)                                 => test.fail("wrong reason for too much precision")
+
+@test
+fn test_a_collector_on_a_shared_port_can_tell_the_dialects_apart() [io]
+    // RFC 5424 § 6.2.2's VERSION is what separates them: after the
+    // priority an RFC 5424 message has `1` and a space, and an RFC 3164
+    // message has a three-letter month abbreviation.
+    test.case("`<34>1 ` is the modern format")
+    match syslogmsg.detect_format(octets_of("<34>1 2003-10-11T22:14:15Z h a - - -"))
+        None                      => test.fail("that is a well-formed RFC 5424 message")
+        Some(SyslogFormatRfc5424) => test.assert(true)
+        Some(SyslogFormatRfc3164) => test.fail("the version says otherwise")
+
+    test.case("`<34>Oct` is the BSD one")
+    match syslogmsg.detect_format(octets_of("<34>Oct 11 22:14:15 mymachine su: failed"))
+        None                      => test.fail("that is a well-formed RFC 3164 message")
+        Some(SyslogFormatRfc3164) => test.assert(true)
+        Some(SyslogFormatRfc5424) => test.fail("there is no version field there")
+
+    test.case("and octets with no priority at all are neither")
+    match syslogmsg.detect_format(octets_of("Use the BFG!"))
+        Some(_) => test.fail("that packet has no priority")
+        None    => test.assert(true)
+
+@test
+fn test_check_finds_a_fault_where_the_value_was_built() [io]
+    // A service that assembles a message from configuration finds a
+    // 300-character hostname at start-up rather than once per log line
+    // forever.
+    test.case("a hostname past RFC 5424 § 6.2.4's 255 octets")
+    let long_host = syslogmsg.with_hostname(a_message(), str.repeat("h", 300))
+    match syslogmsg.check(long_host)
+        None                                         => test.fail("§ 6.2.4 allows 255")
+        Some(SyslogFieldTooLong(field, octets, max)) =>
+            test.assert(field == "HOSTNAME")
+            test.assert(octets == 300)
+            test.assert(max == 255)
+        Some(_)                                      => test.fail("wrong reason for a long hostname")
+
+    test.case("a repeated SD-ID, found through syslogsd.check")
+    let twice = syslogmsg.with_structured_data(
+                    a_message(),
+                    [syslogsd.element("meta", []), syslogsd.element("meta", [])])
+    match syslogmsg.check(twice)
+        None    => test.fail("RFC 5424 § 6.3.2 forbids it")
+        Some(e) => test.assert(syslogerror.code(e) == "sd_id_repeated")
+
+    test.case("and a message with nothing wrong with it is None")
+    match syslogmsg.check(syslogmsg.with_app_name(a_message(), "evntslog"))
+        Some(_) => test.fail("that message can be written")
+        None    => test.assert(true)
+
+@test
+fn test_the_two_ways_content_goes_in_are_two_functions() [io]
+    // RFC 5424 § 6.4: the byte order mark is what declares UTF-8, so
+    // whether the content IS text is a fact the message carries.
+    test.case("text is marked UTF-8")
+    test.assert(syslogmsg.with_msg_text(a_message(), "an entry").msg_utf8)
+
+    test.case("octets are not")
+    test.assert(not syslogmsg.with_msg_bytes(a_message(), [255 as u8]).msg_utf8)
+
+    test.case("and the mark is never part of what comes back")
+    match syslogmsg.msg_text(syslogmsg.with_msg_text(a_message(), "an entry"))
+        None    => test.fail("it went in as text")
+        Some(s) => test.assert(s == "an entry")
+
+@test
+fn test_the_error_taxonomy_answers_the_three_questions_asked_of_it() [io]
+    test.case("a code is stable, short, and carries nothing the octets held")
+    test.assert(syslogerror.code(SyslogFrameTruncated(4812)) == "frame_truncated")
+    test.assert(syslogerror.code(SyslogBadPri(0)) == "bad_pri")
+
+    test.case("a positional fault says where, counted from the start of the stream")
+    test.assert(syslogerror.offset_of(SyslogFrameTruncated(4812)) == 4812)
+
+    test.case("and a fault about a value rather than a place says -1")
+    test.assert(syslogerror.offset_of(SyslogFieldTooLong("HOSTNAME", 300, 255)) == -1)
+    test.assert(syslogerror.offset_of(SyslogSdIdRepeated("meta")) == -1)
+
+    test.case("the five framing faults, which end a connection")
+    test.assert(syslogerror.is_framing_fault(SyslogBadFrameLength(0)))
+    test.assert(syslogerror.is_framing_fault(SyslogFrameTooLarge(99999, 480)))
+    test.assert(syslogerror.is_framing_fault(SyslogFrameTruncated(5)))
+    test.assert(syslogerror.is_framing_fault(SyslogTrailerInMessage(5)))
+    test.assert(syslogerror.is_framing_fault(SyslogMessageTooLong(2000, 1024)))
+
+    test.case("and the message faults, which cost one message")
+    test.assert(not syslogerror.is_framing_fault(SyslogBadPri(0)))
+    test.assert(not syslogerror.is_framing_fault(SyslogSdNameInvalid("a b")))
+    test.assert(not syslogerror.is_framing_fault(SyslogMsgNotUtf8(40)))
+    test.assert(not syslogerror.is_framing_fault(SyslogFieldEmpty("HOSTNAME")))
+    test.assert(not syslogerror.is_framing_fault(SyslogSdIdNotRegistered("myThing")))
+    test.assert(not syslogerror.is_framing_fault(SyslogBadStructuredData(12, "]")))

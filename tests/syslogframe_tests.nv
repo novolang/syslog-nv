@@ -1,0 +1,228 @@
+// syslogframe_tests.nv — the API suite for the reader.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// syslog-nv.syslogframe.<fn>`.  What is asserted is the two framings of
+// RFC 6587 § 3.4 and the one division the package is built on — a fault
+// that costs one message against a fault that costs the connection.
+
+use std.test
+use syslogframe
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+fn counting_reader() -> SyslogReader
+    syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+
+fn line_reader() -> SyslogReader
+    syslogframe.reader(SyslogNonTransparent(SyslogTrailerLf),
+                       syslogframe.default_limits())
+
+@test
+fn test_a_fresh_reader_holds_nothing_and_has_consumed_nothing() [io]
+    test.case("a new reader")
+    let r = counting_reader()
+    test.assert(syslogframe.pending_len(r) == 0)
+    test.assert(syslogframe.offset(r) == 0)
+
+    test.case("and it knows the framing it was made with")
+    match syslogframe.framing_of(r)
+        SyslogOctetCounting => test.assert(true)
+        _                   => test.fail("that reader counts octets")
+
+@test
+fn test_a_prefix_is_not_a_message_and_not_an_error() [io]
+    // The distinction the reader is built on: "wait for more octets" is
+    // `frame: None`, and it is not a variant of `SyslogError`.  On a
+    // socket it is the ordinary case, and a reader that reported it as
+    // an error would have every caller filtering one variant out of its
+    // logs forever.
+    test.case("a length with no message behind it yet")
+    match syslogframe.feed(counting_reader(), octets_of("5 "))
+        Err(_)  => test.fail("a partial frame is not malformed")
+        Ok(fed) =>
+            match fed.frame
+                Some(_) => test.fail("nothing has been counted out yet")
+                None    => test.assert(true)
+
+    test.case("and a line with no trailer yet")
+    match syslogframe.feed(line_reader(), octets_of("<34>Oct"))
+        Err(_)  => test.fail("a partial line is not malformed")
+        Ok(fed) =>
+            match fed.frame
+                Some(_) => test.fail("no trailer has arrived")
+                None    => test.assert(true)
+
+@test
+fn test_octet_counting_takes_exactly_the_octets_the_length_declared() [io]
+    // RFC 6587 § 3.4.1.  The count is octets, so a newline inside the
+    // message is ordinary content — which is the whole reason this
+    // framing exists.
+    test.case("`7 <13>abc` is one seven-octet message")
+    match syslogframe.feed(counting_reader(), octets_of("7 <13>ab"))
+        Err(_)  => test.fail("that is a well-formed frame")
+        Ok(fed) =>
+            match fed.frame
+                None    => test.fail("seven octets arrived")
+                Some(f) =>
+                    test.assert(list.len(f.octets) == 7)
+                    test.assert(f.at == 2)
+
+    test.case("a message with a newline in it goes through unharmed")
+    match syslogframe.drain(counting_reader(), octets_of("3 a\nb"))
+        Err(_) => test.fail("a newline is an octet like any other here")
+        Ok(d)  => test.assert(list.len(d.frames) == 1)
+
+    test.case("a length that begins with zero is refused — § 3.4.1 says non-zero")
+    match syslogframe.feed(counting_reader(), octets_of("07 abcdefg"))
+        Ok(_)  => test.fail("MSG-LEN starts with a non-zero digit")
+        Err(e) => test.assert(syslogerror.is_framing_fault(e))
+
+@test
+fn test_a_framing_fault_costs_the_connection_and_a_message_fault_costs_one_message() [io]
+    // The division this package is built on.  A receiver that treated
+    // them the same either throws away a connection over one bad
+    // message, or keeps reading a stream it has lost its place in.
+    test.case("a length that is not a length leaves the reader nowhere to resynchronise")
+    match syslogframe.feed(counting_reader(), octets_of("abc def"))
+        Ok(_)  => test.fail("`abc` is not a MSG-LEN")
+        Err(e) =>
+            test.assert(syslogerror.is_framing_fault(e))
+            test.assert(syslogerror.code(e) == "bad_frame_length")
+
+    test.case("a frame larger than the limit is a framing fault too")
+    // Under octet counting the declared length is the whole cost, and
+    // a ten-digit length is ten octets to send.
+    let tiny = syslogframe.reader(SyslogOctetCounting, syslogframe.small_limits())
+    match syslogframe.feed(tiny, octets_of("99999 x"))
+        Ok(_)                                        => test.fail("99999 is past a 480-octet limit")
+        Err(SyslogFrameTooLarge(octets, max_octets)) =>
+            test.assert(octets == 99999)
+            test.assert(max_octets == 480)
+        Err(_)                                       => test.fail("wrong reason for an oversized frame")
+
+    test.case("the small limit is RFC 5424 § 6.1's minimum, and no more")
+    test.assert(syslogframe.small_limits().max_frame_octets == 480)
+    test.assert(syslogframe.default_limits().max_frame_octets == 8192)
+
+@test
+fn test_a_close_ends_the_last_line_and_truncates_the_last_count() [io]
+    // The two framings answer a close differently, and both answers
+    // matter.
+    test.case("under line framing the octets before a close ARE a message")
+    // § 3.4.2 does not require a trailer on the last one, and the
+    // last line of a connection is the one that says why the sender
+    // is going away.
+    match syslogframe.feed(line_reader(), octets_of("<34>goodbye"))
+        Err(_)  => test.fail("no trailer yet is not a fault")
+        Ok(fed) =>
+            match syslogframe.finish(fed.reader)
+                Err(_)   => test.fail("a last line with no trailer is a message")
+                Ok(last) =>
+                    match last.frame
+                        None    => test.fail("the pending octets are the last message")
+                        Some(f) => test.assert(list.len(f.octets) == 11)
+
+    test.case("under octet counting a short frame is truncated, not short")
+    match syslogframe.feed(counting_reader(), octets_of("99 <34>x"))
+        Err(_)  => test.fail("a partial frame is not yet a fault")
+        Ok(fed) =>
+            match syslogframe.finish(fed.reader)
+                Ok(_)  => test.fail("the length said 99 and 5 arrived")
+                Err(e) => test.assert(syslogerror.is_framing_fault(e))
+
+    test.case("and a close with nothing pending is an ordinary end")
+    match syslogframe.finish(line_reader())
+        Err(_)   => test.fail("closing between messages is not a fault")
+        Ok(done) =>
+            match done.frame
+                Some(_) => test.fail("there was nothing pending")
+                None    => test.assert(true)
+
+@test
+fn test_two_messages_in_one_packet_are_two_frames() [io]
+    // How the host's socket reads split the stream is an artefact.  A
+    // caller that treated one read as one message has written a bug
+    // that works on a desk.
+    test.case("two lines in one chunk drain as two")
+    match syslogframe.drain(line_reader(), octets_of("<34>a\n<34>b\n"))
+        Err(_) => test.fail("both lines are complete")
+        Ok(d)  =>
+            test.assert(list.len(d.frames) == 2)
+            test.assert(syslogframe.pending_len(d.reader) == 0)
+
+    test.case("feed takes one and leaves the other inside")
+    match syslogframe.feed(line_reader(), octets_of("<34>a\n<34>b\n"))
+        Err(_)  => test.fail("both lines are complete")
+        Ok(fed) =>
+            match fed.frame
+                None    => test.fail("the first line is complete")
+                Some(_) =>
+                    match syslogframe.take(fed.reader)
+                        Err(_)     => test.fail("the second line is complete too")
+                        Ok(second) =>
+                            match second.frame
+                                None    => test.fail("take gets what feed left")
+                                Some(_) => test.assert(true)
+
+    test.case("and take on an empty reader gives None and changes nothing")
+    match syslogframe.take(line_reader())
+        Err(_)  => test.fail("an empty reader is not a fault")
+        Ok(fed) =>
+            match fed.frame
+                Some(_) => test.fail("there is nothing to take")
+                None    => test.assert(syslogframe.offset(fed.reader) == 0)
+
+@test
+fn test_a_trailer_inside_a_message_is_refused_at_the_writer() [io]
+    // RFC 6587 § 3.4.2 has no escape for it.  Written anyway, it is two
+    // malformed messages at the receiver, and the sender finds out from
+    // somebody else's log a week later.
+    test.case("a message with a line feed cannot be line-framed")
+    match syslogframe.frame(octets_of("<34>a\nb"), SyslogNonTransparent(SyslogTrailerLf))
+        Ok(_)  => test.fail("that message contains the trailer")
+        Err(e) => test.assert(syslogerror.is_framing_fault(e))
+
+    test.case("the same message frames fine with octet counting")
+    match syslogframe.frame(octets_of("<34>a\nb"), SyslogOctetCounting)
+        Err(_)     => test.fail("octet counting carries any octets")
+        Ok(framed) => test.assert(list.len(framed) == list.len(octets_of("7 <34>a\nb")))
+
+    test.case("a CRLF trailer is two octets and a line feed is one")
+    test.assert(list.len(syslogframe.trailer_octets(SyslogTrailerCrLf)) == 2)
+    test.assert(list.len(syslogframe.trailer_octets(SyslogTrailerLf)) == 1)
+    test.assert(list.len(syslogframe.trailer_octets(SyslogTrailerNul)) == 1)
+
+    test.case("and detection is not a framing to write with")
+    match syslogframe.frame(octets_of("<34>a"), SyslogFramingDetect)
+        Ok(_)  => test.fail("detection is a question about a stream arriving")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_framing_is_settled_once_from_the_first_octet() [io]
+    // Deciding per message cannot be done safely: an RFC 3164 message
+    // can begin with a digit, so a stream of them read as octet-counted
+    // is cut at lengths taken out of somebody's log text.
+    test.case("a `<` means a message, so non-transparent framing")
+    match syslogframe.detect_framing(octets_of("<34>Oct"))
+        None                      => test.fail("`<` begins a syslog message")
+        Some(SyslogOctetCounting) => test.fail("`<` is not a MSG-LEN")
+        Some(_)                   => test.assert(true)
+
+    test.case("a non-zero digit means a length, so octet counting")
+    match syslogframe.detect_framing(octets_of("72 <34>"))
+        None                      => test.fail("`7` begins a MSG-LEN")
+        Some(SyslogOctetCounting) => test.assert(true)
+        Some(_)                   => test.fail("a digit is not the start of a message")
+
+    test.case("and anything else is neither")
+    match syslogframe.detect_framing(octets_of("hello"))
+        Some(_) => test.fail("`h` begins neither framing")
+        None    => test.assert(true)
+
+    test.case("a detecting reader says so until the first octet arrives")
+    let undecided = syslogframe.reader(SyslogFramingDetect, syslogframe.default_limits())
+    match syslogframe.framing_of(undecided)
+        SyslogFramingDetect => test.assert(true)
+        _                   => test.fail("nothing has arrived to decide from")

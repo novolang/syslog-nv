@@ -1,0 +1,487 @@
+// syslogframe.nv — the load-bearing interface: where one message ends,
+// decided by a reader that performs nothing.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY FRAMING IS A SEPARATE PROBLEM
+//
+// Over UDP a syslog message needs no framing: one datagram is one
+// message and the network says where it ends.  Over TCP and over TLS
+// there is no such boundary, and RFC 6587 writes down the two ways
+// implementations find one.
+//
+// OCTET COUNTING (§ 3.4.1) puts the length in front: a decimal number
+// beginning with a non-zero digit, one space, then exactly that many
+// octets of message.  It can carry any octets at all, including
+// newlines, and it is what RFC 5425's TLS transport requires.
+//
+// NON-TRANSPARENT FRAMING (§ 3.4.2) puts a delimiter after: usually a
+// line feed, sometimes a carriage return and line feed, sometimes a
+// NUL.  It is what almost everything sends, because it is what writing
+// a log line to a socket already looks like, and it cannot carry a
+// message containing the delimiter — there is no escape for it in the
+// section.  A sender that writes one anyway splits its own message
+// into two, and the receiver sees two malformed messages rather than
+// one good one.  `format` in this module refuses to do that.
+//
+// THE FEED-AND-DRAIN SHAPE
+//
+// This is a `core` package, so nothing here may open a socket, set a
+// timeout or wait.  A syslog stream is exactly what a caller wants to
+// read incrementally.  Those two facts are reconciled by a state
+// machine the host pumps: it holds the connection, hands over whatever
+// octets it has, and takes back the frames those octets completed.
+//
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     let fed = syslogframe.feed(r, chunk)!       // as many times as you like
+//     let more = syslogframe.take(fed.reader)!    // until `frame` is None
+//
+// ONE FRAME PER CALL, and `frame: None` means "not yet" and not
+// "never".  A partial message is the ordinary case on a socket, and a
+// reader that reported it as an error would have every caller filtering
+// one variant out of its logs forever.
+//
+// A FRAME IS OCTETS, NOT A PARSED MESSAGE
+//
+// `take` hands back the octets of one message and does not parse them.
+// That is deliberate and it is what makes a relay possible: RFC 6587
+// § 3.4 is about the transport and says nothing about what is inside a
+// frame, and a relay forwarding a message must forward THE OCTETS IT
+// RECEIVED.  A reader that parsed and re-rendered would change the
+// spelling of a timestamp, the order of the structured data, the
+// spacing — and would corrupt anything it could not parse, which is
+// the traffic most worth forwarding.  A collector calls
+// `syslogmsg.detect_format` and then the parser it names; a relay does
+// not have to call anything.
+//
+// THE FRAMINGS CANNOT BE MIXED, AND THE READER IS TOLD WHICH ONE
+//
+// A reader holds one framing for the whole stream.  Deciding per
+// message cannot be done safely: the octets of an RFC 3164 message can
+// begin with a digit, so a stream of them read as octet-counted
+// produces frames cut at lengths taken out of somebody's log text.
+// `SyslogFramingDetect` exists for a receiver that genuinely does not
+// know which of its senders it has, and it decides ONCE, from the first
+// octet, and then holds that answer for the connection — the rule is
+// in `detect_framing`.
+
+use syslogerror
+
+// The octet that ends a message under non-transparent framing.
+//
+// RFC 6587 § 3.4.2 names these three and says implementations vary,
+// which is why the reader is told which one rather than guessing.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     println("${list.len(syslogframe.trailer_octets(SyslogTrailerCrLf))}")   // 2
+// ```
+pub enum SyslogTrailer
+    // A line feed, `%d10`.  The common one.
+    SyslogTrailerLf
+    // A carriage return and a line feed, `%d13 %d10`.
+    SyslogTrailerCrLf
+    // A NUL, `%d00`.
+    SyslogTrailerNul
+
+// How a stream is cut into messages.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     println("${syslogframe.pending_len(r)}")    // 0
+// ```
+pub enum SyslogFraming
+    // RFC 6587 § 3.4.1: a decimal length, a space, then that many
+    // octets.  Carries any octets, and required by RFC 5425's TLS
+    // transport.
+    SyslogOctetCounting
+    // RFC 6587 § 3.4.2: a message, then the trailer.  Cannot carry a
+    // message containing the trailer octet.
+    SyslogNonTransparent(trailer: SyslogTrailer)
+    // Decide from the first octet of the stream, once, and hold that
+    // answer for the connection.  `detect_framing` is the rule.  A
+    // reader made with this answers the framing it settled on from
+    // `framing_of`, so a caller can log which of its senders speaks
+    // which.
+    SyslogFramingDetect
+
+// What a reader will refuse to grow past.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     println("${syslogframe.default_limits().max_frame_octets}")
+// ```
+pub struct SyslogLimits
+    // The most octets one message may have.  Exceeding it is
+    // `SyslogFrameTooLarge`, and it is a FRAMING fault, so the
+    // transport is finished.
+    //
+    // The limit exists because the unbounded version is a denial of
+    // service that costs the sender nothing: under octet counting a
+    // ten-digit length is ten octets to send and would be a gigabyte
+    // to hold, and under non-transparent framing a sender that never
+    // writes the trailer makes the reader buffer the connection
+    // forever.  It is a value the caller owns rather than a constant
+    // this package chose, because a collector and a microcontroller
+    // want numbers three orders of magnitude apart.
+    max_frame_octets: Int
+
+// One message's octets, and where in the stream they started.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogNonTransparent(SyslogTrailerLf),
+//                                syslogframe.default_limits())
+//     match syslogframe.feed(r, [10 as u8])
+//         Ok(fed) =>
+//             match fed.frame
+//                 Some(f) => println("${f.at} + ${list.len(f.octets)}")
+//                 None    => println("nothing complete yet")
+//         Err(e)  => println(e.message())
+// ```
+pub struct SyslogFrame
+    // The message, with the length prefix or the trailer removed.
+    // Exactly what the sender sent, so a relay can forward it
+    // unchanged.
+    octets: [u8]
+    // The offset of this message's first octet, counted from the first
+    // octet the reader was ever given.  The same counter `offset`
+    // answers and the same one a `SyslogError` carries.
+    at: Int
+
+// A reader and the one frame that came out of it, if one did.
+//
+// A struct rather than a tuple because the two halves are used at
+// different places: the caller reassigns the reader and dispatches on
+// the frame.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     match syslogframe.take(r)
+//         Ok(fed) => println("${syslogframe.pending_len(fed.reader)}")   // 0
+//         Err(e)  => println(e.message())
+// ```
+pub struct SyslogFed
+    // The reader, carried forward.
+    reader: SyslogReader
+    // `None` means no complete message in what the reader has been
+    // given yet, which on a socket is the ordinary case and not a
+    // fault.
+    frame: ?SyslogFrame
+
+// A reader and every frame a drain produced.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogNonTransparent(SyslogTrailerLf),
+//                                syslogframe.default_limits())
+//     match syslogframe.drain(r, [65 as u8, 10 as u8])
+//         Ok(d)  => println("${list.len(d.frames)}")     // 1
+//         Err(e) => println(e.message())
+// ```
+pub struct SyslogDrained
+    // The reader, carried forward.
+    reader: SyslogReader
+    // Every frame that came out, in order.  Empty when the octets
+    // completed none.
+    frames: [SyslogFrame]
+
+// The state between "some octets turned up" and "here is a message".
+//
+// Opaque: the fields are here because a struct needs them, and a
+// caller that reaches into one has coupled itself to a buffering
+// decision this package intends to change.  `pending_len`, `offset`
+// and `framing_of` are the three facts about a reader that are
+// anybody's business.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     println("${syslogframe.offset(r)}")      // 0
+// ```
+pub struct SyslogReader
+    framing: SyslogFraming
+    limits: SyslogLimits
+    pending: [u8]
+    consumed: Int
+
+// A frame of at most 8192 octets.
+//
+// Four times what RFC 5424 § 6.1 says a receiver should support, which
+// leaves room for the senders that ignore it, and small enough that a
+// thousand idle connections are eight megabytes rather than a machine.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     println("${syslogframe.default_limits().max_frame_octets}")   // 8192
+// ```
+pub fn default_limits() -> SyslogLimits
+    todo("syslog-nv.syslogframe.default_limits")
+
+// A frame of at most 480 octets.
+//
+// The minimum RFC 5424 § 6.1 requires a receiver to support, and
+// nothing more.  Named here rather than left to each caller with a
+// small memory budget to invent, because every one of them that
+// invented it separately would pick a different number and none of
+// them would be the one the RFC names.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     println("${syslogframe.small_limits().max_frame_octets}")     // 480
+// ```
+pub fn small_limits() -> SyslogLimits
+    todo("syslog-nv.syslogframe.small_limits")
+
+// A reader holding nothing, for one framing and one set of limits.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogNonTransparent(SyslogTrailerLf),
+//                                syslogframe.default_limits())
+//     println("${syslogframe.pending_len(r)}")    // 0
+// ```
+pub fn reader(framing: SyslogFraming, limits: SyslogLimits) -> SyslogReader
+    todo("syslog-nv.syslogframe.reader")
+
+// Adds octets and takes one frame, if the addition completed one.
+//
+// Takes ONE.  Octets that complete three messages — a busy sender
+// whose three lines arrived in one packet — leave two inside, and
+// `take` is what gets them.  `drain` is that loop written once.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     // "5 " with no message yet: a length, and nothing to count.
+//     match syslogframe.feed(r, [53 as u8, 32 as u8])
+//         Ok(fed) =>
+//             match fed.frame
+//                 None    => println("partial, as expected")
+//                 Some(_) => println("a message")
+//         Err(e)  => println(e.message())
+// ```
+pub fn feed(r: SyslogReader, octets: [u8]) -> Result<SyslogFed, SyslogError>
+    todo("syslog-nv.syslogframe.feed")
+
+// Takes one frame if a complete one is already buffered, adding
+// nothing.
+//
+// `frame` is `None` when the buffer holds a prefix, and the reader
+// comes back unchanged.  A caller loops on this until `None` and then
+// goes back to its socket.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     match syslogframe.take(r)
+//         Ok(fed) =>
+//             match fed.frame
+//                 None    => println("an empty reader has nothing to give")
+//                 Some(_) => println("this cannot happen here")
+//         Err(e)  => println(e.message())
+// ```
+pub fn take(r: SyslogReader) -> Result<SyslogFed, SyslogError>
+    todo("syslog-nv.syslogframe.take")
+
+// Adds octets and takes every frame they completed.
+//
+// `feed` and `take` with the pump written once, here, instead of once
+// per caller.  Use `feed` when the caller wants to act on each message
+// before reading the next, and this when it wants the batch.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogNonTransparent(SyslogTrailerLf),
+//                                syslogframe.default_limits())
+//     // Two lines in one packet, which is the ordinary case.
+//     match syslogframe.drain(r, [65 as u8, 10 as u8, 66 as u8, 10 as u8])
+//         Ok(d)  => println("${list.len(d.frames)}")    // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn drain(r: SyslogReader, octets: [u8]) -> Result<SyslogDrained, SyslogError>
+    todo("syslog-nv.syslogframe.drain")
+
+// Tells the reader the peer closed, and takes the last frame.
+//
+// This is not a formality, and the two framings answer differently.
+//
+// Under non-transparent framing the octets before the close ARE a
+// message: RFC 6587 § 3.4.2 does not require a trailer on the last
+// one, and a receiver that dropped them would lose the final line of
+// every connection — which is the line that says why the sender is
+// going away.
+//
+// Under octet counting a partial frame is `SyslogFrameTruncated`.  The
+// length said how much was coming and it did not come, so what arrived
+// is a prefix of a message and not a short message.
+//
+// A close with nothing pending gives `frame: None` and no error, under
+// both framings, which is an ordinary end of connection.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogNonTransparent(SyslogTrailerLf),
+//                                syslogframe.default_limits())
+//     match syslogframe.finish(r)
+//         Ok(fed) =>
+//             match fed.frame
+//                 None    => println("closed between messages")
+//                 Some(_) => println("a last message with no trailer")
+//         Err(e)  => println(e.message())
+// ```
+pub fn finish(r: SyslogReader) -> Result<SyslogFed, SyslogError>
+    todo("syslog-nv.syslogframe.finish")
+
+// How many octets the reader is holding.
+//
+// For a caller that bounds its own buffering, and for a supervisor
+// that wants to notice a sender sitting on half a message forever.
+// The limit bounds this too, but a caller may want to act before it
+// does.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     println("${syslogframe.pending_len(r)}")     // 0
+// ```
+pub fn pending_len(r: SyslogReader) -> Int
+    todo("syslog-nv.syslogframe.pending_len")
+
+// How many octets this reader has consumed since it was made.
+//
+// The same counter every `SyslogFrame.at` and every positional
+// `SyslogError` is measured in, so a caller can report a fault's
+// position on a connection without keeping a count of its own.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogOctetCounting, syslogframe.default_limits())
+//     println("${syslogframe.offset(r)}")          // 0
+// ```
+pub fn offset(r: SyslogReader) -> Int
+    todo("syslog-nv.syslogframe.offset")
+
+// The framing this reader is using.
+//
+// For a reader made with `SyslogFramingDetect` this answers
+// `SyslogFramingDetect` until the first octet has arrived and the
+// settled framing afterwards, so a collector can log which dialect
+// each sender speaks and find the one that is about to be a problem.
+// For any other reader it answers what it was made with.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     let r = syslogframe.reader(SyslogFramingDetect, syslogframe.default_limits())
+//     match syslogframe.framing_of(r)
+//         SyslogFramingDetect => println("nothing has arrived yet")
+//         _                   => println("settled")
+// ```
+pub fn framing_of(r: SyslogReader) -> SyslogFraming
+    todo("syslog-nv.syslogframe.framing_of")
+
+// Which framing some octets are in, or `None`.
+//
+// The rule is that the two framings cannot begin the same way.  An
+// octet-counted frame begins with a non-zero decimal digit (RFC 6587
+// § 3.4.1); a syslog message begins with `<` (RFC 5424 § 6.2.1, RFC
+// 3164 § 4.1.1), and a non-transparent frame begins with the message.
+// So `<` means non-transparent framing, `1` to `9` means octet
+// counting, and anything else is neither.
+//
+// It says nothing about which trailer a non-transparent stream uses.
+// A reader made with `SyslogFramingDetect` settles on
+// `SyslogTrailerLf`, which is what RFC 6587 § 3.4.2 calls the usual
+// one; a receiver whose senders write something else has to be told.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     match syslogframe.detect_framing([60 as u8])       // <
+//         Some(SyslogOctetCounting) => println("counted")
+//         Some(_)                   => println("a message, so non-transparent")
+//         None                      => println("neither")
+// ```
+pub fn detect_framing(octets: [u8]) -> ?SyslogFraming
+    todo("syslog-nv.syslogframe.detect_framing")
+
+// The octets a trailer is: one for a line feed or a NUL, two for a
+// carriage return and line feed.
+//
+// ```novo
+// use syslogframe
+//
+// fn main() [io]
+//     println("${list.len(syslogframe.trailer_octets(SyslogTrailerLf))}")      // 1
+//     println("${list.len(syslogframe.trailer_octets(SyslogTrailerCrLf))}")    // 2
+// ```
+pub fn trailer_octets(t: SyslogTrailer) -> [u8]
+    todo("syslog-nv.syslogframe.trailer_octets")
+
+// One message's octets, framed for sending.
+//
+// Under octet counting it writes the length in decimal, a space, and
+// the message.  Under non-transparent framing it writes the message
+// and the trailer — and REFUSES with `SyslogTrailerInMessage` if the
+// message contains the trailer octet, naming where.
+//
+// That refusal is the point.  RFC 6587 § 3.4.2 gives no escape for a
+// trailer inside a message, so writing one anyway produces two
+// malformed messages at the receiver, and the caller who did it finds
+// out from somebody else's log a week later.  The fix is octet
+// counting, which carries any octets; the message does not have to
+// change.
+//
+// `SyslogFramingDetect` is not a framing to write with, and is
+// refused: detection is a question about a stream that is arriving.
+//
+// ```novo
+// use syslogframe
+// use syslogerror
+//
+// fn main() [io]
+//     // A message with a newline in it, under line-feed framing.
+//     match syslogframe.frame([65 as u8, 10 as u8, 66 as u8],
+//                             SyslogNonTransparent(SyslogTrailerLf))
+//         Ok(_)  => println("this does not happen")
+//         Err(e) => println(syslogerror.code(e))     // trailer_in_message
+// ```
+pub fn frame(message: [u8], framing: SyslogFraming) -> Result<[u8], SyslogError>
+    todo("syslog-nv.syslogframe.frame")

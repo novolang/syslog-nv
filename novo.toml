@@ -1,0 +1,64 @@
+[package]
+name        = "syslog-nv"
+version     = "0.0.1"
+description = "Syslog in both of its formats: RFC 5424 with its structured data, and the older BSD form of RFC 3164, each parsed and formatted.  The priority is decomposed into a typed facility and a typed severity, structured-data parameter values are escaped to RFC 5424 § 6.3.3 exactly, and the two RFC 6587 framings — octet counting and non-transparent — are a feed-and-drain reader over bytes.  No socket, no clock.  Interface only: every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: bytes in, values out, and nothing performs anything.
+#
+# Syslog is almost always written as "open a UDP socket and send", and
+# that is the half this package does not have.  The octets arrive from
+# wherever the host got them — a datagram, a TLS record under RFC 5425,
+# a `/dev/log` datagram, a capture file being replayed — and
+# `syslogframe` is a feed-and-drain state machine that takes them and
+# hands back finished frames.  Nothing here connects, waits, retries or
+# reads a clock, and no public function declares an effect row.
+#
+# THE CLOCK IS THE PART WORTH SPELLING OUT.  A syslog message carries a
+# timestamp, so the obvious surface would be "stamp this with now",
+# which needs `[time]` and would make the package `host`.  It is not
+# here.  A timestamp is a value the caller parsed or supplied, which is
+# what makes a parse reproducible against the RFCs' own examples, and
+# what lets an RFC 3164 message — whose timestamp carries no year and
+# no zone — be resolved with a year the caller names rather than with
+# one this package guessed.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["syslog", "rfc-5424", "rfc-3164", "rfc-6587", "logging", "structured-data", "framing", "sans-io", "codec"]
+repository  = "https://github.com/novolang/syslog-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Syslog in both formats, with no socket and no clock"
+
+[dependencies]
+# None, and the candidate was calendar-nv.
+#
+# calendar-nv holds a civil date and a civil time, and its `iso8601`
+# module parses an RFC 3339 string — which is what an RFC 5424
+# TIMESTAMP is a restricted subset of.  It does not fit the other half
+# of this package.  A `CivilDate` requires a year, and an RFC 3164
+# timestamp (§ 4.1.2) is `Mmm dd hh:mm:ss` with no year and no zone
+# offset at all, so the BSD half needs a timestamp type whose year and
+# offset can be ABSENT.  That type has to exist here whatever else is
+# taken, and taking calendar-nv for the RFC 5424 half alone would put
+# two timestamp types in one `SyslogMessage`, with the first thing a
+# reader has to check being which of them a given message filled in.
+#
+# So `SyslogTimestamp` carries the parsed fields, with `?Int` for the
+# year and `?Int` for the offset, and a caller that wants civil
+# arithmetic hands those fields to calendar-nv itself.  The README says
+# the same thing under "What is not included".

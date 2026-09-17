@@ -1,0 +1,207 @@
+// syslog5424_tests.nv — the API suite for the modern format.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// syslog-nv.syslog5424.<fn>`.  The fixtures are the four example
+// messages of RFC 5424 § 6.5 and the timestamp examples of § 6.2.3.1,
+// so what is asserted is the RFC and not this package's opinion of it.
+
+use std.test
+use syslog5424
+use syslogmsg
+use syslogpri
+use syslogsd
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+// RFC 5424 § 6.5, Example 1 — every optional field the NILVALUE except
+// the message identifier, and a UTF-8 MSG behind a byte order mark.
+fn example_one() -> Str
+    "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - test"
+
+// RFC 5424 § 6.5, Example 3 — one structured-data element.
+fn example_three() -> Str
+    "<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] test"
+
+@test
+fn test_the_rfcs_first_example_takes_apart_into_its_six_header_fields() [io]
+    test.case("the priority is facility 4, severity 2")
+    match syslog5424.parse(octets_of(example_one()))
+        Err(_) => test.fail("§ 6.5's first example is a valid message")
+        Ok(m)  =>
+            test.assert(syslogpri.facility_number(m.pri.facility) == 4)
+            test.assert(syslogpri.severity_number(m.pri.severity) == 2)
+
+            test.case("the hostname and the application name are read")
+            test.assert(m.hostname == "mymachine.example.com")
+            test.assert(m.app_name == "su")
+
+            test.case("the NILVALUE PROCID reads back as an empty field")
+            // `-` means "the sender has none", and an empty string is
+            // how that arrives here.
+            test.assert(m.procid == "")
+
+            test.case("the message identifier is ID47")
+            test.assert(m.msgid == "ID47")
+
+            test.case("and the NILVALUE structured data is an empty list")
+            test.assert(list.len(m.structured_data) == 0)
+
+@test
+fn test_a_version_that_is_not_1_is_refused_and_names_what_it_found() [io]
+    // § 6.2.2 defines one version.  This is what a caller that handed
+    // RFC 3164 octets to this parser gets, and the found version is in
+    // the refusal so a log can say which dialect turned up.
+    test.case("an RFC 3164 message is not version 1")
+    match syslog5424.parse(octets_of("<34>Oct 11 22:14:15 mymachine su: failed"))
+        Ok(_)  => test.fail("that is the BSD format, not RFC 5424")
+        Err(e) => test.assert(not syslogerror.is_framing_fault(e))
+
+    test.case("and a message claiming version 2 names the 2")
+    match syslog5424.parse(octets_of("<34>2 - - - - - -"))
+        Ok(_)                         => test.fail("§ 6.2.2 defines only version 1")
+        Err(SyslogNotVersion1(found)) => test.assert(found == "2")
+        Err(_)                        => test.fail("wrong reason for a bad version")
+
+    test.case("the version this package writes is 1")
+    test.assert(syslog5424.version() == 1)
+
+@test
+fn test_the_fractional_second_stops_at_six_digits() [io]
+    // § 6.2.3.1 gives `2003-08-24T05:14:15.000000003-07:00` as an
+    // example that is NOT valid, for having nine digits.
+    test.case("three digits are milliseconds")
+    match syslog5424.parse_timestamp("2003-10-11T22:14:15.003Z")
+        Err(_) => test.fail("§ 6.2.3.1 gives this exact timestamp as valid")
+        Ok(t)  =>
+            test.assert(t.micros == 3000)
+            match t.year
+                None    => test.fail("an RFC 5424 timestamp always has a year")
+                Some(y) => test.assert(y == 2003)
+
+    test.case("six digits are the most there can be")
+    match syslog5424.parse_timestamp("2003-08-24T05:14:15.000003-07:00")
+        Err(_) => test.fail("§ 6.2.3.1 gives this one as valid too")
+        Ok(t)  =>
+            test.assert(t.micros == 3)
+            match t.offset_minutes
+                None    => test.fail("-07:00 is an offset")
+                Some(o) => test.assert(o == -420)
+
+    test.case("nine digits are refused, naming how many there were")
+    match syslog5424.parse_timestamp("2003-08-24T05:14:15.000000003-07:00")
+        Ok(_)                                  => test.fail("§ 6.2.3.1 says this is invalid")
+        Err(SyslogTimestampTooPrecise(digits)) => test.assert(digits == 9)
+        Err(_)                                 => test.fail("wrong reason for too much precision")
+
+    test.case("Z is an offset of zero and not an absent one")
+    match syslog5424.parse_timestamp("1985-04-12T23:20:50.52Z")
+        Err(_) => test.fail("§ 6.2.3.1's first example")
+        Ok(t)  =>
+            match t.offset_minutes
+                None    => test.fail("Z is UTC, which is Some(0)")
+                Some(o) => test.assert(o == 0)
+
+@test
+fn test_a_timestamp_with_no_year_cannot_be_written_in_this_syntax() [io]
+    // The refusal that keeps a year the sender never sent out of a
+    // record somebody may read as evidence.
+    test.case("an RFC 3164 timestamp is refused, naming what is missing")
+    match syslogmsg.timestamp(None, 10, 11, 22, 14, 15, 0, None)
+        Err(_) => test.fail("that is a well-formed RFC 3164 reading")
+        Ok(t)  =>
+            match syslog5424.format_timestamp(t)
+                Ok(_)                                   => test.fail("it has no year to write")
+                Err(SyslogTimestampIncomplete(missing)) => test.assert(missing == "year")
+                Err(_)                                  => test.fail("wrong reason")
+
+    test.case("and once the caller supplies one, it writes")
+    match syslogmsg.timestamp(None, 10, 11, 22, 14, 15, 0, None)
+        Err(_) => test.fail("that is a well-formed RFC 3164 reading")
+        Ok(t)  =>
+            match syslog5424.format_timestamp(syslogmsg.timestamp_resolved(t, 2003, 0))
+                Err(_) => test.fail("it has a year and an offset now")
+                Ok(s)  => test.assert(s == "2003-10-11T22:14:15Z")
+
+@test
+fn test_a_header_field_may_not_hold_a_space_and_may_not_be_empty() [io]
+    // § 6.2: the five fields are separated by single spaces, so a
+    // space inside one shifts every field after it by one.
+    test.case("printable US-ASCII is %d33 to %d126, which excludes the space")
+    test.assert(syslog5424.is_printable_ascii("mymachine.example.com"))
+    test.assert(not syslog5424.is_printable_ascii("my machine"))
+
+    test.case("a hostname with a space in it is refused before it is written")
+    let spaced = syslogmsg.with_hostname(
+                     syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice)),
+                     "my machine")
+    match syslogmsg.check(spaced)
+        None                                => test.fail("a space would shift every later field")
+        Some(SyslogFieldNotPrintable(f, _)) => test.assert(f == "HOSTNAME")
+        Some(_)                             => test.fail("wrong reason for a spaced hostname")
+
+    test.case("and the field lengths are § 6.2's own numbers")
+    let limits = syslog5424.field_limits()
+    test.assert(limits.hostname == 255)
+    test.assert(limits.app_name == 48)
+    test.assert(limits.procid == 128)
+    test.assert(limits.msgid == 32)
+
+@test
+fn test_the_byte_order_mark_is_a_declaration_and_not_content() [io]
+    // § 6.4.  A caller searching its log lines for the first word
+    // would otherwise never match one.
+    test.case("the mark is three octets")
+    test.assert(list.len(syslog5424.bom()) == 3)
+
+    test.case("text that went in as text comes back as text, without a mark")
+    let m = syslogmsg.with_msg_text(
+                syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice)),
+                "an application event log entry")
+    match syslogmsg.msg_text(m)
+        None    => test.fail("it went in as text")
+        Some(s) => test.assert(s == "an application event log entry")
+
+    test.case("and octets that are not UTF-8 are not text")
+    let raw = syslogmsg.with_msg_bytes(
+                  syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice)),
+                  [255 as u8, 254 as u8])
+    match syslogmsg.msg_text(raw)
+        Some(_) => test.fail("0xFF 0xFE is not UTF-8")
+        None    => test.assert(true)
+
+@test
+fn test_structured_data_survives_a_round_trip_through_the_wire() [io]
+    test.case("the RFC's third example carries one element with three parameters")
+    match syslog5424.parse(octets_of(example_three()))
+        Err(_) => test.fail("§ 6.5's third example is a valid message")
+        Ok(m)  =>
+            test.assert(list.len(m.structured_data) == 1)
+            match syslogsd.element_of(m.structured_data, "exampleSDID@32473")
+                None     => test.fail("that is the element's SD-ID")
+                Some(el) => test.assert(list.len(el.params) == 3)
+
+    test.case("and formatting it again gives the octets it came from")
+    match syslog5424.parse(octets_of(example_three()))
+        Err(_) => test.fail("§ 6.5's third example is a valid message")
+        Ok(m)  =>
+            match syslog5424.format(m)
+                Err(_)      => test.fail("a message that parsed can be written")
+                Ok(written) => test.assert(list.len(written) == list.len(octets_of(example_three())))
+
+@test
+fn test_the_header_can_be_read_without_holding_the_content() [io]
+    // What a relay routing on facility needs, and what a collector
+    // counting messages per application needs.
+    test.case("the count that comes back is where the MSG begins")
+    match syslog5424.parse_header(octets_of("<34>1 - - - - - - hello"))
+        Err(_)     => test.fail("that is a well-formed header")
+        Ok((m, n)) =>
+            test.assert(syslogpri.prival(m.pri) == 34)
+            test.assert(list.len(m.msg) == 0)
+            test.assert(n == 18)
+
+    test.case("§ 6.1's two sizes are advice about the transport")
+    test.assert(syslog5424.minimum_supported_octets() == 480)
+    test.assert(syslog5424.recommended_supported_octets() == 2048)

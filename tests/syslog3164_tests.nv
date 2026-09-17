@@ -1,0 +1,194 @@
+// syslog3164_tests.nv — the API suite for the BSD format.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// syslog-nv.syslog3164.<fn>`.  The fixtures are the example messages of
+// RFC 3164 § 5.4, including the two the section gives as things a relay
+// meets rather than as things a sender should write.
+
+use std.test
+use syslog3164
+use syslogmsg
+use syslogpri
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+// RFC 3164 § 5.4, the first example message.
+fn example_one() -> Str
+    "<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8"
+
+// RFC 3164 § 5.4, the third example — note the TWO spaces before the 5.
+fn example_three() -> Str
+    "<13>Feb  5 17:32:18 10.0.0.99 Use the BFG!"
+
+@test
+fn test_the_rfcs_first_example_takes_apart_the_way_the_section_says() [io]
+    test.case("the priority is facility 4, severity 2")
+    match syslog3164.parse(octets_of(example_one()))
+        Err(_) => test.fail("§ 5.4's first example is a valid message")
+        Ok(m)  =>
+            test.assert(syslogpri.prival(m.pri) == 34)
+
+            test.case("the hostname is the machine and never a domain name")
+            // § 4.1.2: the HOSTNAME is a hostname, an IPv4 address or
+            // an IPv6 address, and the domain must not be in it.
+            test.assert(m.hostname == "mymachine")
+
+            test.case("the TAG arrives in app_name, under RFC 5424's name for it")
+            test.assert(m.app_name == "su")
+
+            test.case("and the fields this format does not have are empty")
+            test.assert(m.msgid == "")
+            test.assert(list.len(m.structured_data) == 0)
+
+@test
+fn test_the_day_below_ten_is_space_padded_and_not_zero_padded() [io]
+    // § 4.1.2, and the RFC's own third example has it: `Feb  5`.
+    test.case("`Feb  5 17:32:18` is the RFC's own spelling")
+    match syslog3164.parse_timestamp("Feb  5 17:32:18")
+        Err(_) => test.fail("§ 5.4's third example carries this timestamp")
+        Ok(t)  =>
+            test.assert(t.month == 2)
+            test.assert(t.day == 5)
+            test.assert(t.hour == 17)
+
+    test.case("`Feb 05` is refused")
+    // Harsh, and deliberate: two spellings mean the field is sometimes
+    // two characters and sometimes three, and every parser downstream
+    // that split on spaces gets a different answer for nine days a
+    // month.
+    match syslog3164.parse_timestamp("Feb 05 17:32:18")
+        Ok(_)  => test.fail("§ 4.1.2 pads the day with a space")
+        Err(e) => test.assert(not syslogerror.is_framing_fault(e))
+
+    test.case("and this package writes the space")
+    match syslogmsg.timestamp(Some(2003), 1, 1, 0, 0, 0, 0, Some(0))
+        Err(_) => test.fail("the first of January is a date")
+        Ok(t)  =>
+            match syslog3164.format_timestamp(t)
+                Err(_) => test.fail("every part this syntax needs is present")
+                Ok(s)  => test.assert(s == "Jan  1 00:00:00")
+
+    test.case("the twelve abbreviations are the only ones, and they are English")
+    test.assert(list.len(syslog3164.month_abbreviations()) == 12)
+
+@test
+fn test_a_parsed_bsd_timestamp_names_no_instant_until_a_caller_says_so() [io]
+    // The information is not in the message.  A library that filled in
+    // the receiver's year would be wrong for exactly the messages that
+    // matter: the ones from the minutes around midnight on the
+    // thirty-first of December.
+    test.case("no year and no offset come out of the parse")
+    match syslog3164.parse_timestamp("Dec 31 23:59:58")
+        Err(_) => test.fail("that is a well-formed RFC 3164 timestamp")
+        Ok(t)  =>
+            match t.year
+                Some(_) => test.fail("§ 4.1.2 carries no year")
+                None    => test.assert(true)
+            match t.offset_minutes
+                Some(_) => test.fail("§ 4.1.2 carries no zone")
+                None    => test.assert(true)
+
+    test.case("and the caller that knows supplies both, under its own name")
+    match syslog3164.parse_timestamp("Dec 31 23:59:58")
+        Err(_) => test.fail("that is a well-formed RFC 3164 timestamp")
+        Ok(t)  =>
+            let dated = syslogmsg.timestamp_resolved(t, 2025, -300)
+            match dated.year
+                None    => test.fail("the caller just supplied one")
+                Some(y) => test.assert(y == 2025)
+            match dated.offset_minutes
+                None    => test.fail("the caller just supplied one")
+                Some(o) => test.assert(o == -300)
+
+@test
+fn test_the_tag_ends_at_the_first_character_that_is_not_alphanumeric() [io]
+    // § 4.1.3, and the character that ended it belongs to the CONTENT.
+    test.case("`su: …` splits into `su` and a content that starts with the colon")
+    let (tag, rest) = syslog3164.split_tag(octets_of("su: 'su root' failed"))
+    test.assert(tag == "su")
+    test.assert(list.len(rest) == list.len(octets_of(": 'su root' failed")))
+
+    test.case("a bracket ends it too, and stays")
+    let (tag2, rest2) = syslog3164.split_tag(octets_of("sshd[1234]: accepted"))
+    test.assert(tag2 == "sshd")
+    test.assert(list.len(rest2) == list.len(octets_of("[1234]: accepted")))
+
+    test.case("and the TAG stops at thirty-two characters")
+    test.assert(syslog3164.max_tag_chars() == 32)
+
+@test
+fn test_the_process_id_is_lifted_out_of_the_content_by_parse() [io]
+    // A convention rather than the RFC, and the reason it is here: a
+    // collector that left `[1234]` in the text could not group one
+    // process's messages, and every consumer would write the same
+    // regular expression.
+    test.case("`sshd[1234]:` gives an app name and a process id")
+    match syslog3164.parse(octets_of("<34>Oct 11 22:14:15 host sshd[1234]: accepted"))
+        Err(_) => test.fail("that is a well-formed BSD message")
+        Ok(m)  =>
+            test.assert(m.app_name == "sshd")
+            test.assert(m.procid == "1234")
+
+    test.case("and a sender with no process id leaves the field empty")
+    match syslog3164.parse(octets_of(example_one()))
+        Err(_) => test.fail("§ 5.4's first example is valid")
+        Ok(m)  => test.assert(m.procid == "")
+
+@test
+fn test_the_relaxed_parser_cannot_fail_because_a_relay_may_not_drop() [io]
+    // § 4.3.3: a packet with no valid priority gets a priority of 13
+    // and becomes content in its entirety.  A collector that refused
+    // those would be discarding exactly the senders nobody is watching.
+    test.case("`Use the BFG!` with no priority is still a message")
+    let bare = syslog3164.parse_relaxed(octets_of("Use the BFG!"),
+                                        syslog3164.default_pri())
+    test.assert(syslogpri.prival(bare.pri) == 13)
+    test.assert(list.len(bare.msg) == list.len(octets_of("Use the BFG!")))
+
+    test.case("13 is facility 1, severity 5 — user-level, Notice")
+    test.assert(syslogpri.facility_number(syslog3164.default_pri().facility) == 1)
+    test.assert(syslogpri.severity_number(syslog3164.default_pri().severity) == 5)
+
+    test.case("nothing is invented: an absent timestamp stays absent")
+    // § 4.3.2 asks a RELAY to fill one in, which a relay does on
+    // purpose and not as a side effect of parsing.
+    match bare.timestamp
+        Some(_) => test.fail("that packet carried no timestamp")
+        None    => test.assert(true)
+
+    test.case("and the strict parser refuses the same octets")
+    match syslog3164.parse(octets_of("Use the BFG!"))
+        Ok(_)  => test.fail("§ 4.1 requires a priority")
+        Err(e) => test.assert(syslogerror.offset_of(e) == 0)
+
+    test.case("the third example, which IS well formed, reads as itself")
+    let repaired = syslog3164.parse_relaxed(octets_of(example_three()),
+                                            syslog3164.default_pri())
+    test.assert(repaired.hostname == "10.0.0.99")
+
+@test
+fn test_this_format_is_capped_at_1024_octets_and_the_cap_is_enforced() [io]
+    // § 4.1, and unlike RFC 5424 § 6.1's two sizes this one is a
+    // limit rather than advice.
+    test.case("the cap is 1024")
+    test.assert(syslog3164.max_message_octets() == 1024)
+
+    test.case("a message this format cannot hold is refused when written")
+    let m = syslogmsg.with_msg_text(
+                syslogmsg.with_app_name(
+                    syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice)),
+                    "big"),
+                str.repeat("x", 2000))
+    match syslog3164.format(m)
+        Ok(_)  => test.fail("2000 octets do not fit in 1024")
+        Err(e) => test.assert(syslogerror.is_framing_fault(e))
+
+    test.case("and a message that does fit is written")
+    let small = syslogmsg.with_app_name(
+                    syslogmsg.message(syslogpri.pri(SyslogFacAuth, SyslogSevCritical)),
+                    "su")
+    match syslog3164.format(small)
+        Err(_)     => test.fail("that message fits")
+        Ok(octets) => test.assert(list.len(octets) > 0)

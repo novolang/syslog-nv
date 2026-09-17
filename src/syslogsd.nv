@@ -1,0 +1,329 @@
+// syslogsd.nv — structured data, and the three characters that have to
+// be escaped inside a parameter value.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT STRUCTURED DATA IS
+//
+// RFC 5424 § 6.3 adds one field to a syslog message that is not free
+// text.  It is a list of ELEMENTS, each written `[` an SD-ID, then
+// zero or more `name="value"` pairs, then `]`.  A whole field of them
+// looks like this:
+//
+//     [exampleSDID@32473 iut="3" eventSource="Application"][meta language="en"]
+//
+// A message with no structured data writes the NILVALUE `-` in the
+// field's place, which is not the same as an empty list of elements
+// only in how it is written; both mean there is none.
+//
+// THE ESCAPING IS THE PART THAT GETS SHIPPED WRONG
+//
+// A PARAM-VALUE is delimited by double quotes, and RFC 5424 § 6.3.3
+// requires exactly three characters inside one to be escaped with a
+// backslash: the double quote `"`, the backslash `\` itself, and the
+// closing bracket `]`.
+//
+// The bracket is the one people miss, because it is not a delimiter of
+// the value and escaping it looks unnecessary.  It is not: a receiver
+// scanning for the `]` that ends the element finds the one inside the
+// value first, and everything after it is read as another element or
+// as the message.  A sender that forgot it turns one message into two
+// malformed ones, and the failure only appears when a user puts a
+// bracket in a log line, which is to say: in production, months later,
+// from a stack trace or an IPv6 address.
+//
+// So escaping is a function here rather than something each caller
+// writes, `format` applies it, and `parse` reverses it.
+//
+// THE OTHER HALF OF § 6.3.3: A BACKSLASH BEFORE ANYTHING ELSE STAYS
+//
+// The same section says a backslash that is followed by a character
+// other than those three is NOT an escape: the receiver keeps both
+// characters, the backslash and the one after it.  A parser that
+// dropped the backslash — which is what a general-purpose unescape
+// routine does — silently corrupts every Windows path in every log it
+// reads, and `C:\temp` arrives as `C:temp`.  `unescape_param_value` is
+// that rule, written once.
+
+use syslogerror
+
+// One `name="value"` pair inside a structured-data element.
+//
+// The value is held unescaped: what the sender meant, not what went on
+// the wire.  `format` escapes on the way out and `parse` unescapes on
+// the way in, so a caller never sees a backslash it did not put there.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let p = syslogsd.param("eventSource", "Application")
+//     println(p.value)          // Application
+// ```
+pub struct SyslogSdParam
+    // The PARAM-NAME.  An SD-NAME: one to thirty-two printable
+    // US-ASCII characters, and none of `=`, space, `]` or `"`
+    // (RFC 5424 § 6.3.3).
+    name: Str
+    // The PARAM-VALUE, unescaped.  Any text; the three characters
+    // § 6.3.3 names are escaped when it is written.
+    value: Str
+
+// One `[SD-ID name="value" …]` element.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let e = syslogsd.element("exampleSDID@32473",
+//                              [syslogsd.param("iut", "3")])
+//     println(e.id)             // exampleSDID@32473
+// ```
+pub struct SyslogSdElement
+    // The SD-ID.  An SD-NAME, and one that must not appear twice in a
+    // message (RFC 5424 § 6.3.2).  A name with no `@` in it is
+    // reserved by IANA; a private one is written
+    // `name@<private enterprise number>`.
+    id: Str
+    // The parameters, in the order they were written.  Order is kept
+    // because it is what the sender wrote and a relay that reordered
+    // them would be rewriting a message it is only forwarding.
+    params: [SyslogSdParam]
+
+// A parameter from a name and an unescaped value.
+//
+// It does not check the name.  `is_valid_sd_name` is the check, and
+// `check` runs it over a whole field — one failure path rather than
+// two, and a constructor with no error channel rather than a
+// `Result` at every call site in a builder.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let p = syslogsd.param("iut", "3")
+//     println(p.name)           // iut
+// ```
+pub fn param(name: Str, value: Str) -> SyslogSdParam
+    todo("syslog-nv.syslogsd.param")
+
+// An element from an SD-ID and its parameters.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let e = syslogsd.element("meta", [syslogsd.param("language", "en")])
+//     println("${list.len(e.params)}")   // 1
+// ```
+pub fn element(id: Str, params: [SyslogSdParam]) -> SyslogSdElement
+    todo("syslog-nv.syslogsd.element")
+
+// The value of the first parameter with this name, or `None`.
+//
+// The first, because a message can arrive with the same PARAM-NAME
+// twice and a receiver has to answer something.  Answering the first
+// is what a reader of the wire text does, and `values_of` is there for
+// a caller that wants to know there were two.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let e = syslogsd.element("meta", [syslogsd.param("language", "en")])
+//     match syslogsd.value_of(e, "language")
+//         Some(v) => println(v)          // en
+//         None    => println("no such parameter")
+// ```
+pub fn value_of(element: SyslogSdElement, name: Str) -> ?Str
+    todo("syslog-nv.syslogsd.value_of")
+
+// Every value with this name, in the order they were written.
+//
+// Empty when there is none.  A caller that finds two has found a
+// sender writing something the reader of a single value would have
+// silently lost.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let e = syslogsd.element("meta", [syslogsd.param("language", "en")])
+//     let langs = syslogsd.values_of(e, "language")
+//     println("${list.len(langs)}")      // 1
+// ```
+pub fn values_of(element: SyslogSdElement, name: Str) -> [Str]
+    todo("syslog-nv.syslogsd.values_of")
+
+// The element with this SD-ID, or `None`.
+//
+// At most one can match, because RFC 5424 § 6.3.2 forbids a repeated
+// SD-ID and `check` is what refuses a field that has one.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let sd = [syslogsd.element("meta", [syslogsd.param("language", "en")])]
+//     match syslogsd.element_of(sd, "origin")
+//         Some(_) => println("this message says where it came from")
+//         None    => println("no origin element")
+// ```
+pub fn element_of(sd: [SyslogSdElement], id: Str) -> ?SyslogSdElement
+    todo("syslog-nv.syslogsd.element_of")
+
+// A parameter value with the three characters RFC 5424 § 6.3.3 names
+// escaped: `"`, `\` and `]`, each preceded by a backslash.
+//
+// Nothing else is escaped.  A newline, a tab and a non-ASCII character
+// go through as they are, because § 6.3.3 names three characters and
+// not a class.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     // The bracket is the one that has to be escaped and the one
+//     // people forget; unescaped it ends the element early.
+//     println(syslogsd.escape_param_value("array[0]"))    // array[0\]
+// ```
+pub fn escape_param_value(value: Str) -> Str
+    todo("syslog-nv.syslogsd.escape_param_value")
+
+// A parameter value with RFC 5424 § 6.3.3's escapes undone.
+//
+// `\"`, `\\` and `\]` become `"`, `\` and `]`.  A backslash before
+// ANY OTHER character is kept, along with the character after it,
+// because § 6.3.3 says a receiver must not remove it.  That is what
+// keeps a Windows path intact: `C:\temp` unescapes to `C:\temp` and
+// not to `C:temp`.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     println(syslogsd.unescape_param_value("C:\\temp"))   // C:\temp
+// ```
+pub fn unescape_param_value(value: Str) -> Str
+    todo("syslog-nv.syslogsd.unescape_param_value")
+
+// Whether a string is an SD-NAME.
+//
+// RFC 5424 § 6.3.3: one to thirty-two printable US-ASCII characters —
+// %d33 to %d126 — with `=`, space, `]` and `"` excluded.  Both an
+// SD-ID and a PARAM-NAME are SD-NAMEs, so this is the one check for
+// both.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let good = syslogsd.is_valid_sd_name("exampleSDID@32473")
+//     let bad  = syslogsd.is_valid_sd_name("has space")
+//     println("${good}")                 // true
+//     println("${bad}")                  // false
+// ```
+pub fn is_valid_sd_name(name: Str) -> Bool
+    todo("syslog-nv.syslogsd.is_valid_sd_name")
+
+// Whether this SD-ID is one of the three RFC 5424 § 6.3.2 registers.
+//
+// Those three are `timeQuality`, `origin` and `meta`.  A name with no
+// `@` in it is reserved by IANA, so a sender inventing one has taken a
+// name that is not its to take; a private element is written
+// `name@<private enterprise number>` and this answers false for it,
+// which is correct and not a refusal — `enterprise_number` is the
+// question to ask about those.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let registered = syslogsd.is_registered_sd_id("timeQuality")
+//     let invented   = syslogsd.is_registered_sd_id("myThing")
+//     println("${registered}")           // true
+//     println("${invented}")             // false
+// ```
+pub fn is_registered_sd_id(id: Str) -> Bool
+    todo("syslog-nv.syslogsd.is_registered_sd_id")
+
+// The private enterprise number of an SD-ID written
+// `name@<number>`, or `None`.
+//
+// RFC 5424 § 6.3.2's form for an SD-ID nobody registered.  `None` for
+// a name with no `@`, and `None` when what follows the `@` is not a
+// number — a sender writing `myThing@example.com` has written
+// something this cannot answer for.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     match syslogsd.enterprise_number("exampleSDID@32473")
+//         Some(n) => println("${n}")     // 32473
+//         None    => println("not a private SD-ID")
+// ```
+pub fn enterprise_number(id: Str) -> ?Int
+    todo("syslog-nv.syslogsd.enterprise_number")
+
+// The first thing wrong with a whole structured-data field, or `None`.
+//
+// Checks what RFC 5424 § 6.3 requires and a builder can get wrong: an
+// SD-ID or a PARAM-NAME that is not an SD-NAME, the same SD-ID twice,
+// and a bare SD-ID that is not one of the three registered names.
+// `syslog5424.format` calls it, so a caller that builds a message and
+// formats it does not have to; it is public for a caller that wants to
+// find the fault where the value was built rather than where it was
+// written.
+//
+// ```novo
+// use syslogsd
+// use syslogerror
+//
+// fn main() [io]
+//     let twice = [syslogsd.element("meta", []), syslogsd.element("meta", [])]
+//     match syslogsd.check(twice)
+//         Some(e) => println(syslogerror.code(e))    // sd_id_repeated
+//         None    => println("this field is well formed")
+// ```
+pub fn check(sd: [SyslogSdElement]) -> ?SyslogError
+    todo("syslog-nv.syslogsd.check")
+
+// The structured data at the start of some octets, and how many octets
+// it took.
+//
+// Reads the NILVALUE `-` as an empty list, and otherwise one or more
+// `[…]` elements with no separator between them (RFC 5424 § 6.3).
+// Parameter values come back unescaped.  It stops at the octet after
+// the last `]`, which is where the space before the MSG is.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     let nil_field = [45 as u8]          // -
+//     match syslogsd.parse(nil_field)
+//         Ok((sd, n)) => println("${list.len(sd)} element(s) in ${n} octet(s)")
+//         Err(e)      => println(e.message())
+// ```
+pub fn parse(octets: [u8]) -> Result<([SyslogSdElement], Int), SyslogError>
+    todo("syslog-nv.syslogsd.parse")
+
+// A structured-data field written the way RFC 5424 § 6.3 writes it.
+//
+// An empty list is the NILVALUE `-`, which is what the field has to
+// hold when there is no structured data — the field is never omitted.
+// Parameter values are escaped on the way out.  Refuses what `check`
+// refuses, because a field this package wrote and could not read back
+// would be worse than an error.
+//
+// ```novo
+// use syslogsd
+//
+// fn main() [io]
+//     match syslogsd.format([syslogsd.element("meta", [syslogsd.param("language", "en")])])
+//         Ok(s)  => println(s)            // [meta language="en"]
+//         Err(e) => println(e.message())
+// ```
+pub fn format(sd: [SyslogSdElement]) -> Result<Str, SyslogError>
+    todo("syslog-nv.syslogsd.format")

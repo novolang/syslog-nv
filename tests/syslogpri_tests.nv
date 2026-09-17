@@ -1,0 +1,166 @@
+// syslogpri_tests.nv — the API suite for the priority.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// syslog-nv.syslogpri.<fn>`.  What is asserted is the arithmetic of
+// RFC 5424 § 6.2.1 against the RFCs' own example messages, and the one
+// comparison everybody writes backwards.
+
+use std.test
+use syslogpri
+use syslogerror
+
+// The priority of RFC 5424 § 6.5's first example message,
+// `<34>1 2003-10-11T22:14:15.003Z …`: facility 4, severity 2.
+fn example_one_prival() -> Int
+    34
+
+// The priority of RFC 5424 § 6.5's second example message,
+// `<165>1 2003-08-24T05:14:15.000003-07:00 …`: facility 20, severity 5.
+fn example_two_prival() -> Int
+    165
+
+@test
+fn test_a_prival_is_a_facility_and_a_severity_and_not_a_scale() [io]
+    test.case("<34> is local-use nothing — it is facility 4, severity 2")
+    // RFC 5424 § 6.2.1: PRIVAL = facility * 8 + severity.  34 is
+    // 4 * 8 + 2, which the RFC's own first example spells out.
+    match syslogpri.from_prival(example_one_prival())
+        Err(_) => test.fail("34 is a valid priority value")
+        Ok(p)  =>
+            test.assert(syslogpri.facility_number(p.facility) == 4)
+            test.assert(syslogpri.severity_number(p.severity) == 2)
+
+    test.case("<165> is facility 20, severity 5")
+    match syslogpri.from_prival(example_two_prival())
+        Err(_) => test.fail("165 is a valid priority value")
+        Ok(p)  =>
+            test.assert(syslogpri.facility_number(p.facility) == 20)
+            test.assert(syslogpri.severity_number(p.severity) == 5)
+
+    test.case("and the round trip is the same number")
+    test.assert(syslogpri.prival(syslogpri.pri(SyslogFacLocal4, SyslogSevNotice)) == 165)
+
+@test
+fn test_191_is_the_last_priority_and_192_is_not_one() [io]
+    // Twenty-four facilities and eight severities: 23 * 8 + 7.
+    test.case("191 is facility 23, severity 7")
+    match syslogpri.from_prival(191)
+        Err(_) => test.fail("191 is the largest valid priority value")
+        Ok(p)  =>
+            test.assert(syslogpri.facility_number(p.facility) == 23)
+            test.assert(syslogpri.severity_number(p.severity) == 7)
+
+    test.case("192 is refused, carrying the value it was given")
+    match syslogpri.from_prival(192)
+        Ok(_)                          => test.fail("there is no facility 24")
+        Err(SyslogPriValueTooLarge(v)) => test.assert(v == 192)
+        Err(_)                         => test.fail("wrong reason for an oversized priority")
+
+    test.case("and so is a negative one")
+    match syslogpri.from_prival(-1)
+        Ok(_)  => test.fail("a priority value is not signed")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_lower_severity_number_is_more_severe() [io]
+    // The mistake this function exists to prevent: writing the
+    // comparison the way it reads in English gives a filter that
+    // passes Debug and drops Emergency.
+    test.case("Error is at least as severe as Warning")
+    test.assert(syslogpri.is_at_least_as_severe(SyslogSevError, SyslogSevWarning))
+
+    test.case("Emergency is at least as severe as everything")
+    test.assert(syslogpri.is_at_least_as_severe(SyslogSevEmergency, SyslogSevDebug))
+
+    test.case("and Debug is not at least as severe as Warning")
+    test.assert(not syslogpri.is_at_least_as_severe(SyslogSevDebug, SyslogSevWarning))
+
+    test.case("a severity is at least as severe as itself")
+    test.assert(syslogpri.is_at_least_as_severe(SyslogSevNotice, SyslogSevNotice))
+
+    test.case("which is the numbering of Table 2, not a convention")
+    test.assert(syslogpri.severity_number(SyslogSevEmergency) == 0)
+    test.assert(syslogpri.severity_number(SyslogSevDebug) == 7)
+
+@test
+fn test_there_is_no_facility_lookup_by_name_because_the_names_repeat() [io]
+    test.case("facilities 4 and 10 share Table 1's description")
+    // Which is why `facility_description` is for a person to read and
+    // there is no function that goes the other way.
+    test.assert(syslogpri.facility_description(SyslogFacAuth)
+                == syslogpri.facility_description(SyslogFacAuthPriv))
+
+    test.case("and so do 9 and 15")
+    test.assert(syslogpri.facility_description(SyslogFacCron)
+                == syslogpri.facility_description(SyslogFacCron2))
+
+    test.case("the numbers are what tell them apart")
+    test.assert(syslogpri.facility_number(SyslogFacCron) == 9)
+    test.assert(syslogpri.facility_number(SyslogFacCron2) == 15)
+
+    test.case("severity names do NOT repeat, so that lookup exists")
+    match syslogpri.severity_from_name("warning")
+        None    => test.fail("Warning is one of Table 2's eight names")
+        Some(s) => test.assert(syslogpri.severity_number(s) == 4)
+
+    test.case("and an unrecognised level is None rather than a default")
+    match syslogpri.severity_from_name("verbose")
+        Some(_) => test.fail("`verbose` is not a syslog severity")
+        None    => test.assert(true)
+
+    test.case("Table 2's name is what `severity_name` answers")
+    test.assert(syslogpri.severity_name(SyslogSevNotice) == "Notice")
+
+@test
+fn test_a_leading_zero_is_not_another_spelling_of_a_priority() [io]
+    // RFC 5424 § 6.2.1 forbids it, and a receiver that accepted `<09>`
+    // would have two spellings for one priority and a formatter that
+    // could not round-trip.
+    test.case("<09> is refused, at the octet the zero is on")
+    let padded = [60 as u8, 48 as u8, 57 as u8, 62 as u8]
+    match syslogpri.parse_pri(padded)
+        Ok(_)                            => test.fail("<09> has a leading zero")
+        Err(SyslogPriHasLeadingZero(at)) => test.assert(at == 1)
+        Err(_)                           => test.fail("wrong reason for a padded priority")
+
+    test.case("<0> is not a leading zero — it is facility 0, severity 0")
+    let kern = [60 as u8, 48 as u8, 62 as u8]
+    match syslogpri.parse_pri(kern)
+        Err(_)     => test.fail("<0> is a valid priority")
+        Ok((p, n)) =>
+            test.assert(syslogpri.prival(p) == 0)
+            test.assert(n == 3)
+
+    test.case("and the count that comes back is where the rest starts")
+    let example = [60 as u8, 51 as u8, 52 as u8, 62 as u8, 49 as u8]
+    match syslogpri.parse_pri(example)
+        Err(_)     => test.fail("<34> is a valid priority")
+        Ok((_, n)) => test.assert(n == 4)
+
+@test
+fn test_a_priority_is_written_the_way_both_formats_begin() [io]
+    test.case("<34> for facility 4, severity 2")
+    test.assert(syslogpri.format_pri(syslogpri.pri(SyslogFacAuth, SyslogSevCritical)) == "<34>")
+
+    test.case("<0> and never <000>")
+    test.assert(syslogpri.format_pri(syslogpri.pri(SyslogFacKern, SyslogSevEmergency)) == "<0>")
+
+    test.case("a facility can be built from its number too")
+    match syslogpri.facility_from_number(20)
+        Err(_) => test.fail("20 is local use 4")
+        Ok(f)  => test.assert(syslogpri.facility_number(f) == 20)
+
+    test.case("and a severity from its own")
+    match syslogpri.severity_from_number(3)
+        Err(_) => test.fail("3 is Error")
+        Ok(s)  => test.assert(syslogpri.severity_name(s) == "Error")
+
+    test.case("a facility number above 23 is refused")
+    match syslogpri.facility_from_number(24)
+        Ok(_)  => test.fail("there is no facility 24")
+        Err(e) => test.assert(not syslogerror.is_framing_fault(e))
+
+    test.case("and a severity number above 7")
+    match syslogpri.severity_from_number(8)
+        Ok(_)  => test.fail("there is no severity 8")
+        Err(e) => test.assert(syslogerror.offset_of(e) == -1)

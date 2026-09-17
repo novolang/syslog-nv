@@ -1,0 +1,483 @@
+// syslogmsg.nv — one message value for both formats, and a timestamp
+// whose year is allowed to be missing.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ONE VALUE, TWO FORMATS
+//
+// RFC 5424 and RFC 3164 describe the same thing twice.  Both messages
+// carry a priority, a time, the name of the machine that spoke and the
+// name of the program that spoke; RFC 5424 adds a process identifier, a
+// message identifier and structured data, and spells the time
+// differently.  A collector that held two message types would ask every
+// consumer of a message to handle both, and every filter, every router
+// and every renderer downstream would be written twice.
+//
+// So there is one `SyslogMessage`.  What RFC 3164 § 4.1.3 calls the TAG
+// arrives in `app_name`, because that is what it is; the `[1234]` a TAG
+// is conventionally followed by arrives in `procid`, because that is
+// what that is; and `msgid` and `structured_data` are empty, because
+// RFC 3164 has neither.  The `format` field records which dialect the
+// message was read from, for a relay that wants to forward in the same
+// one.  It does not decide anything: the function you call is what
+// decides the dialect a message is written in.
+//
+// THE TIMESTAMP'S YEAR AND OFFSET ARE OPTIONAL BECAUSE RFC 3164 HAS
+// NEITHER
+//
+// An RFC 5424 timestamp (§ 6.2.3) is a restricted RFC 3339 string: a
+// four-digit year, a zone offset or `Z`, and up to six digits of
+// fractional seconds.  It names an instant.
+//
+// An RFC 3164 timestamp (§ 4.1.2) is `Mmm dd hh:mm:ss`.  It has no
+// year, no zone and no fraction, and it is in the sender's local time,
+// which the receiver does not know.  It does NOT name an instant.  Two
+// machines an hour apart send indistinguishable timestamps for events
+// an hour apart, and a message that arrives on the first of January
+// belongs to the year that ended yesterday about as often as to the one
+// that began today.
+//
+// A library that hid that — by filling in the receiver's year and the
+// receiver's zone on the way in — would be answering a question it was
+// not asked and would be wrong for exactly the messages that matter,
+// the ones from the minutes around midnight on the thirty-first of
+// December.  So `SyslogTimestamp.year` and `SyslogTimestamp.offset_minutes`
+// are `?Int`, a parsed RFC 3164 timestamp has `None` in both, and
+// `timestamp_resolved` is where a caller that knows the answer supplies
+// it — under its own name, at a place a reader can find.
+//
+// THE MSG IS OCTETS
+//
+// RFC 5424 § 6.4 allows any octet in the MSG, and says that a MSG
+// encoded in UTF-8 must begin with the byte order mark.  So the message
+// content is `[u8]` and not `Str`: a receiver that decoded every
+// message as text would either refuse messages the RFC allows or
+// replace the bytes it could not decode, and a relay doing the second
+// corrupts what it was only supposed to forward.  `msg_text` is the
+// question "is this text", asked when a caller needs the answer.
+
+use syslogpri
+use syslogsd
+use syslogerror
+
+// Which of the two syslog formats a message was read from.
+//
+// ```novo
+// use syslogmsg
+//
+// fn main() [io]
+//     let octets = [60 as u8, 51 as u8, 52 as u8, 62 as u8, 49 as u8, 32 as u8]
+//     match syslogmsg.detect_format(octets)
+//         Some(SyslogFormatRfc5424) => println("the modern one")
+//         Some(SyslogFormatRfc3164) => println("the BSD one")
+//         None                      => println("neither")
+// ```
+pub enum SyslogFormat
+    // RFC 5424: a VERSION of `1`, six header fields, structured data.
+    SyslogFormatRfc5424
+    // RFC 3164: the BSD form, with a priority, a `Mmm dd hh:mm:ss`
+    // timestamp, a hostname and a tagged message.
+    SyslogFormatRfc3164
+
+// A time as one of the two formats writes it, with the parts RFC 3164
+// leaves out marked absent.
+//
+// It is a calendar reading and not an instant.  With a year and an
+// offset it names one moment; without them it names a moment in a year
+// and a zone the receiver has to supply.
+//
+// ```novo
+// use syslogmsg
+//
+// fn main() [io]
+//     match syslogmsg.timestamp(Some(2003), 10, 11, 22, 14, 15, 3000, Some(0))
+//         Ok(t)  => println("${t.hour}")     // 22
+//         Err(e) => println(e.message())
+// ```
+pub struct SyslogTimestamp
+    // The four-digit year, or `None` for an RFC 3164 timestamp, which
+    // carries none (§ 4.1.2).
+    year: ?Int
+    // The month, 1 to 12.
+    month: Int
+    // The day of the month, 1 to 31.
+    day: Int
+    // The hour, 0 to 23.
+    hour: Int
+    // The minute, 0 to 59.
+    minute: Int
+    // The second, 0 to 59.  RFC 5424 § 6.2.3 forbids leap seconds, so
+    // 60 never appears here.
+    second: Int
+    // The fractional second in microseconds, 0 to 999999.  RFC 5424
+    // § 6.2.3.1 caps the fraction at six digits, which is exactly this
+    // resolution; an RFC 3164 timestamp has none and carries 0.
+    micros: Int
+    // Minutes east of UTC, or `None` for an RFC 3164 timestamp, which
+    // is in the sender's local time and does not say what that is.
+    // `Z` is `Some(0)`.
+    offset_minutes: ?Int
+
+// One syslog message, whichever format it came from.
+//
+// Built with `message` and the `with_` functions, or produced by
+// `syslog5424.parse` or `syslog3164.parse`.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.with_hostname(
+//                 syslogmsg.message(syslogpri.pri(SyslogFacLocal4, SyslogSevNotice)),
+//                 "mymachine.example.com")
+//     println(m.hostname)
+// ```
+pub struct SyslogMessage
+    // The facility and the severity.
+    pri: SyslogPri
+    // Which dialect this message was read from.  A record, not an
+    // instruction: `syslog5424.format` writes RFC 5424 whatever this
+    // says, and `syslog3164.format` writes RFC 3164.
+    format: SyslogFormat
+    // The time the sender wrote, or `None` — which RFC 5424 § 6.2.3
+    // allows as the NILVALUE, and which RFC 3164 § 4.3.2 leaves a
+    // relay to fill in.
+    timestamp: ?SyslogTimestamp
+    // The machine that sent the message, or `""` for the NILVALUE.
+    // RFC 5424 § 6.2.4 allows up to 255 octets and prefers a fully
+    // qualified domain name.
+    hostname: Str
+    // The program that sent the message, or `""` for the NILVALUE.
+    // RFC 5424 § 6.2.5 allows up to 48 octets.  An RFC 3164 message's
+    // TAG (§ 4.1.3) arrives here.
+    app_name: Str
+    // The process that sent the message, or `""` for the NILVALUE.
+    // RFC 5424 § 6.2.6 allows up to 128 octets and says it is usually
+    // a process identifier.  The `[1234]` after an RFC 3164 TAG
+    // arrives here, without the brackets.
+    procid: Str
+    // What KIND of message this is, or `""` for the NILVALUE.  RFC
+    // 5424 § 6.2.7 allows up to 32 octets and describes it as the type
+    // of message, so that messages of the same type can be filtered
+    // together.  RFC 3164 has no such field and leaves this empty.
+    msgid: Str
+    // The structured data (RFC 5424 § 6.3).  Empty is the NILVALUE.
+    // RFC 3164 has no such field and leaves this empty.
+    structured_data: [SyslogSdElement]
+    // The free-text part, as octets.  RFC 5424 § 6.4 allows any octet
+    // here, so it is not a `Str`; `msg_text` is how a caller asks
+    // whether it is text.  The byte order mark is NOT part of it — it
+    // is written by the formatter when `msg_utf8` is true.
+    msg: [u8]
+    // Whether `msg` is UTF-8.  Set from the byte order mark on the way
+    // in (RFC 5424 § 6.4), and what makes the formatter write that
+    // mark on the way out.
+    msg_utf8: Bool
+
+// An empty message with a priority: no timestamp, no fields, no
+// structured data, an empty MSG, and `SyslogFormatRfc5424`.
+//
+// The start of the builder.  Every field is absent rather than
+// defaulted, because the NILVALUE that RFC 5424 § 6.2.4 gives a sender
+// with nothing to say is `-` and not a made-up hostname.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevInformational))
+//     println("${syslogpri.prival(m.pri)}")     // 14
+// ```
+pub fn message(pri: SyslogPri) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.message")
+
+// The message with this timestamp.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     match syslogmsg.timestamp(Some(2003), 10, 11, 22, 14, 15, 3000, Some(0))
+//         Ok(t)  => println("${list.len(syslogmsg.with_timestamp(m, t).msg)}")   // 0
+//         Err(e) => println(e.message())
+// ```
+pub fn with_timestamp(m: SyslogMessage, t: SyslogTimestamp) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_timestamp")
+
+// The message with this hostname.
+//
+// `""` means the NILVALUE: the sender has nothing to say for this
+// field.  The length and the printable-ASCII rule are checked by
+// `check` and by the formatters, not here.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     println(syslogmsg.with_hostname(m, "mymachine.example.com").hostname)
+// ```
+pub fn with_hostname(m: SyslogMessage, hostname: Str) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_hostname")
+
+// The message with this application name — RFC 3164's TAG, under RFC
+// 5424's name for it.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     println(syslogmsg.with_app_name(m, "su").app_name)      // su
+// ```
+pub fn with_app_name(m: SyslogMessage, app_name: Str) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_app_name")
+
+// The message with this process identifier.
+//
+// Written without brackets.  RFC 3164's `su[1234]:` puts `1234` here
+// and `su` in `app_name`, and RFC 5424 writes the same value in its own
+// PROCID field (§ 6.2.6).
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     println(syslogmsg.with_procid(m, "1234").procid)        // 1234
+// ```
+pub fn with_procid(m: SyslogMessage, procid: Str) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_procid")
+
+// The message with this message identifier.
+//
+// RFC 5424 § 6.2.7's MSGID: what kind of message this is, so that
+// messages of one kind can be filtered together.  RFC 3164 has no such
+// field, and `syslog3164.format` drops it.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     println(syslogmsg.with_msgid(m, "ID47").msgid)          // ID47
+// ```
+pub fn with_msgid(m: SyslogMessage, msgid: Str) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_msgid")
+
+// The message with this structured data.
+//
+// An empty list is the NILVALUE.  RFC 3164 has no such field, and
+// `syslog3164.format` drops it — which is worth knowing before a
+// program puts something it needs in there and sends it to a BSD
+// collector.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+// use syslogsd
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     let sd = [syslogsd.element("meta", [syslogsd.param("language", "en")])]
+//     println("${list.len(syslogmsg.with_structured_data(m, sd).structured_data)}")   // 1
+// ```
+pub fn with_structured_data(m: SyslogMessage, sd: [SyslogSdElement]) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_structured_data")
+
+// The message with this text as its content, marked UTF-8.
+//
+// Sets `msg_utf8`, so `syslog5424.format` writes the byte order mark
+// RFC 5424 § 6.4 requires in front of a UTF-8 MSG.  The mark is not
+// part of `msg` and never appears in what `msg_text` answers.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     match syslogmsg.msg_text(syslogmsg.with_msg_text(m, "'su root' failed"))
+//         Some(s) => println(s)
+//         None    => println("this cannot happen for text that went in as text")
+// ```
+pub fn with_msg_text(m: SyslogMessage, text: Str) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_msg_text")
+
+// The message with these octets as its content, marked NOT UTF-8.
+//
+// For content that is not text: a relay forwarding octets it did not
+// decode, a sender writing a legacy encoding.  No byte order mark is
+// written, which is what RFC 5424 § 6.4 says about a MSG that is not
+// UTF-8.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice))
+//     println("${list.len(syslogmsg.with_msg_bytes(m, [255 as u8]).msg)}")   // 1
+// ```
+pub fn with_msg_bytes(m: SyslogMessage, octets: [u8]) -> SyslogMessage
+    todo("syslog-nv.syslogmsg.with_msg_bytes")
+
+// The content as text, or `None` when it is not UTF-8.
+//
+// `None` for a message whose `msg_utf8` is false, and `None` for one
+// that claimed UTF-8 with a byte order mark and then carried octets
+// that are not.  A caller that needs to know WHICH of those happened
+// reads `msg_utf8`; a caller that just wants the text asks this.
+//
+// Answering `None` rather than replacing the undecodable octets is the
+// point: a relay that substituted a replacement character would be
+// rewriting a message, and the bytes it lost are the ones a person
+// investigating an incident wanted.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.with_msg_bytes(
+//                 syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice)),
+//                 [255 as u8])
+//     match syslogmsg.msg_text(m)
+//         Some(s) => println(s)
+//         None    => println("not text")
+// ```
+pub fn msg_text(m: SyslogMessage) -> ?Str
+    todo("syslog-nv.syslogmsg.msg_text")
+
+// A timestamp from its parts, or a refusal.
+//
+// `year` and `offset_minutes` are optional because RFC 3164 § 4.1.2
+// has neither; pass `None` for both to build one of those.  `micros` is
+// 0 to 999999, which is the six digits RFC 5424 § 6.2.3.1 allows, and
+// more than that is `SyslogTimestampTooPrecise`.  A month, day, hour,
+// minute or second outside its range is `SyslogBadTimestamp`, and so is
+// a second of 60, because RFC 5424 § 6.2.3 forbids leap seconds.
+//
+// ```novo
+// use syslogmsg
+//
+// fn main() [io]
+//     // The RFC 3164 shape: no year, no offset.
+//     match syslogmsg.timestamp(None, 10, 11, 22, 14, 15, 0, None)
+//         Ok(t)  => println("${t.month}")    // 10
+//         Err(e) => println(e.message())
+// ```
+pub fn timestamp(year: ?Int, month: Int, day: Int, hour: Int, minute: Int, second: Int, micros: Int,
+                 offset_minutes: ?Int) -> Result<SyslogTimestamp, SyslogError>
+    todo("syslog-nv.syslogmsg.timestamp")
+
+// The same timestamp with a year and a zone offset supplied.
+//
+// What an RFC 3164 timestamp needs before it can name an instant, done
+// where a reader can see who decided.  A collector normally passes the
+// year and offset it is running in; an archive tool reading a file from
+// 2019 passes 2019, and gets right the messages the collector's answer
+// would have got wrong.
+//
+// It overwrites both parts whether or not they were already there, so a
+// caller can also use it to re-zone an RFC 5424 timestamp it has
+// decided is wrong.
+//
+// ```novo
+// use syslogmsg
+//
+// fn main() [io]
+//     match syslogmsg.timestamp(None, 12, 31, 23, 59, 58, 0, None)
+//         Ok(t)  =>
+//             // The message was logged in 2025, not in the year the
+//             // collector happens to be started in.
+//             let dated = syslogmsg.timestamp_resolved(t, 2025, 0)
+//             match dated.year
+//                 Some(y) => println("${y}")     // 2025
+//                 None    => println("this cannot happen")
+//         Err(e) => println(e.message())
+// ```
+pub fn timestamp_resolved(t: SyslogTimestamp, year: Int, offset_minutes: Int) -> SyslogTimestamp
+    todo("syslog-nv.syslogmsg.timestamp_resolved")
+
+// Which format some octets are in, or `None` when they are neither.
+//
+// The rule is RFC 5424 § 6.2.2's: after the priority, an RFC 5424
+// message has the VERSION `1` and then a space.  An RFC 3164 message
+// has a timestamp there, and RFC 3164 § 4.1.2 writes a timestamp
+// starting with a three-letter month abbreviation, so the two cannot be
+// confused.  `None` when there is no well-formed priority at all.
+//
+// It looks at the first few octets and parses nothing else, so a
+// collector on a port that receives both dialects calls this and then
+// the matching parser.
+//
+// ```novo
+// use syslogmsg
+//
+// fn main() [io]
+//     // "<34>1 " — a priority, the version, a space.
+//     let octets = [60 as u8, 51 as u8, 52 as u8, 62 as u8, 49 as u8, 32 as u8]
+//     match syslogmsg.detect_format(octets)
+//         Some(SyslogFormatRfc5424) => println("RFC 5424")
+//         Some(SyslogFormatRfc3164) => println("RFC 3164")
+//         None                      => println("not syslog")
+// ```
+pub fn detect_format(octets: [u8]) -> ?SyslogFormat
+    todo("syslog-nv.syslogmsg.detect_format")
+
+// The NILVALUE, which is `"-"`.
+//
+// RFC 5424 § 6.2.4 to § 6.2.7 use it for a header field the sender
+// cannot supply, and § 6.3 for structured data that is absent.  An
+// empty field is not allowed anywhere, so this is what goes in its
+// place.  A message whose HOSTNAME really is the single character `-`
+// is indistinguishable from one that has none, and the RFC has no
+// answer for that either.
+//
+// ```novo
+// use syslogmsg
+//
+// fn main() [io]
+//     println(syslogmsg.nilvalue())      // -
+// ```
+pub fn nilvalue() -> Str
+    todo("syslog-nv.syslogmsg.nilvalue")
+
+// The first thing that would stop this message being written in its
+// own format, or `None`.
+//
+// Checks the header field lengths and the printable-ASCII rule of RFC
+// 5424 § 6.2, the structured data through `syslogsd.check`, and for an
+// RFC 3164 message the TAG rule of § 4.1.3 and the 1024-octet total of
+// § 4.1.
+//
+// The formatters call it, so a caller that builds a message and writes
+// it does not have to.  It is public for a caller that wants the fault
+// reported where the value was built — a service that assembles a
+// message from configuration finds a hostname of 300 characters at
+// start-up rather than once per log line forever.
+//
+// ```novo
+// use syslogmsg
+// use syslogpri
+// use syslogerror
+//
+// fn main() [io]
+//     let m = syslogmsg.with_hostname(
+//                 syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice)),
+//                 "a host name with spaces in it")
+//     match syslogmsg.check(m)
+//         Some(e) => println(syslogerror.code(e))    // field_not_printable
+//         None    => println("this message can be written")
+// ```
+pub fn check(m: SyslogMessage) -> ?SyslogError
+    todo("syslog-nv.syslogmsg.check")

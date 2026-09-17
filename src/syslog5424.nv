@@ -1,0 +1,295 @@
+// syslog5424.nv — the modern format, read and written.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE GRAMMAR, IN ONE LINE
+//
+// RFC 5424 § 6.1 writes a message as a header, a space, the structured
+// data, and — if there is one — a space and the message content:
+//
+//     <165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut="3"] BOMAn application event log entry
+//
+// The header is the priority, the VERSION `1`, and then five fields
+// separated by single spaces: the timestamp, the hostname, the
+// application name, the process identifier and the message identifier.
+// Every one of those five can be the NILVALUE `-`, and none of them can
+// be empty or contain a space, because a space is what separates them.
+//
+// WHY `parse` TAKES OCTETS AND NOT A STRING
+//
+// The MSG may be any octets (§ 6.4), and the fields are printable
+// US-ASCII, which means a message can be perfectly valid and not be
+// text.  A parser taking a `Str` would have to be handed something that
+// had already been decoded, and the decoding is where the message would
+// have been damaged — either refused for bytes the RFC allows, or
+// repaired with replacement characters that a relay then forwards as if
+// they were what the sender wrote.
+//
+// So the octets come in as octets, the header fields are decoded as
+// ASCII because § 6.2 says they are ASCII, and the MSG stays octets.
+//
+// THE BYTE ORDER MARK IS NOT PART OF THE MESSAGE
+//
+// § 6.4 says a MSG encoded in UTF-8 must start with the byte order
+// mark, `%xEF.BB.BF`.  It is a declaration and not content.  `parse`
+// takes it off and sets `msg_utf8`; `format` puts it back when
+// `msg_utf8` is true.  A caller never sees it, and a caller that
+// searched its log lines for the word it thought was first would
+// otherwise never match the first word of any of them.
+//
+// THE TWO SIZES IN § 6.1
+//
+// RFC 5424 § 6.1 says a receiver must support messages of up to 480
+// octets, and should support up to 2048.  Those are the numbers a
+// sender can rely on and the reason a long message gets truncated
+// somewhere it did not expect.  They are functions here rather than
+// something each caller remembers, and they are advice about the
+// network and not a limit this package enforces: nothing here refuses
+// a longer RFC 5424 message, because the transport is what decides.
+
+use syslogmsg
+use syslogerror
+
+// How long RFC 5424 § 6.2 lets each header field be, in octets.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     println("${syslog5424.field_limits().hostname}")     // 255
+// ```
+pub struct SyslogFieldLimits
+    // HOSTNAME: 1 to 255 octets (§ 6.2.4).
+    hostname: Int
+    // APP-NAME: 1 to 48 octets (§ 6.2.5).
+    app_name: Int
+    // PROCID: 1 to 128 octets (§ 6.2.6).
+    procid: Int
+    // MSGID: 1 to 32 octets (§ 6.2.7).
+    msgid: Int
+
+// One whole RFC 5424 message, parsed.
+//
+// Takes exactly one message's octets — what `syslogframe` hands back,
+// or the payload of one datagram — and not a stream.  The structured
+// data comes back with its parameter values unescaped, and the MSG
+// comes back with its byte order mark removed and `msg_utf8` set.
+//
+// A message whose VERSION is not `1` is `SyslogNotVersion1`, which is
+// what a caller that handed RFC 3164 octets to this parser gets, with
+// the version it found in the refusal so a log says which dialect
+// turned up.
+//
+// ```novo
+// use syslog5424
+// use syslogmsg
+// use syslogerror
+//
+// fn main() [io]
+//     // "<34>1 - - - - - -" is the smallest legal RFC 5424 message:
+//     // every field the NILVALUE.
+//     let smallest = bytes.to_byte_list(bytes.from_str("<34>1 - - - - - -"))
+//     match syslog5424.parse(smallest)
+//         Ok(m)  => println("${syslogmsg.nilvalue()} ${m.hostname}")
+//         Err(e) => println(syslogerror.code(e))
+// ```
+pub fn parse(octets: [u8]) -> Result<SyslogMessage, SyslogError>
+    todo("syslog-nv.syslog5424.parse")
+
+// The header and the structured data only, and how many octets they
+// took.
+//
+// For a caller that routes on the envelope and does not want to hold
+// the content: a relay choosing a destination by facility, a collector
+// counting messages per application.  The message that comes back has
+// an empty MSG, and the count is where the MSG begins — one past the
+// space that follows the structured data, or the length of the octets
+// when there is no MSG at all, which § 6.1 allows.
+//
+// ```novo
+// use syslog5424
+// use syslogpri
+//
+// fn main() [io]
+//     let octets = bytes.to_byte_list(bytes.from_str("<34>1 - - - - - - hello"))
+//     match syslog5424.parse_header(octets)
+//         Ok((m, n)) => println("${syslogpri.prival(m.pri)} then octet ${n}")
+//         Err(e)     => println(e.message())
+// ```
+pub fn parse_header(octets: [u8]) -> Result<(SyslogMessage, Int), SyslogError>
+    todo("syslog-nv.syslog5424.parse_header")
+
+// One whole RFC 5424 message, written.
+//
+// Writes the priority with no leading zero, the VERSION `1`, the five
+// header fields with `-` for each one that is empty, the structured
+// data or `-`, and — when there is content — a space, the byte order
+// mark if `msg_utf8`, and the MSG.
+//
+// Refuses what `syslogmsg.check` refuses, so a message with a space in
+// its hostname or a repeated SD-ID is a named error here rather than
+// octets that no receiver can read back.
+//
+// ```novo
+// use syslog5424
+// use syslogmsg
+// use syslogpri
+//
+// fn main() [io]
+//     let m = syslogmsg.with_app_name(
+//                 syslogmsg.message(syslogpri.pri(SyslogFacLocal4, SyslogSevNotice)),
+//                 "evntslog")
+//     match syslog5424.format(m)
+//         Ok(octets) => println("${list.len(octets)} octets")
+//         Err(e)     => println(e.message())
+// ```
+pub fn format(m: SyslogMessage) -> Result<[u8], SyslogError>
+    todo("syslog-nv.syslog5424.format")
+
+// An RFC 5424 TIMESTAMP, parsed.
+//
+// § 6.2.3 takes a subset of RFC 3339: the `T` and the `Z` must be
+// upper case, the `T` is required, and leap seconds must not be used.
+// § 6.2.3.1 caps the fractional second at six digits and gives
+// `2003-08-24T05:14:15.000000003-07:00` as an example that is not
+// valid for having nine.  A fraction longer than six digits is
+// `SyslogTimestampTooPrecise`, naming how many it found.
+//
+// `Z` parses to an offset of `Some(0)`.  The result always has a year
+// and an offset, because this syntax always carries both.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     match syslog5424.parse_timestamp("2003-10-11T22:14:15.003Z")
+//         Ok(t)  => println("${t.micros}")     // 3000
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_timestamp(text: Str) -> Result<SyslogTimestamp, SyslogError>
+    todo("syslog-nv.syslog5424.parse_timestamp")
+
+// A timestamp written the way § 6.2.3 writes one.
+//
+// Refuses a timestamp with no year or no offset as
+// `SyslogTimestampIncomplete`, naming which is missing: that is an RFC
+// 3164 timestamp, and it has to go through
+// `syslogmsg.timestamp_resolved` before anybody can claim it names an
+// instant.  Writing a guess instead would put a year the sender never
+// sent into a record somebody may read as evidence.
+//
+// A zero fraction is written with no fraction at all, and an offset of
+// zero is written `Z`.
+//
+// ```novo
+// use syslog5424
+// use syslogmsg
+//
+// fn main() [io]
+//     match syslogmsg.timestamp(None, 10, 11, 22, 14, 15, 0, None)
+//         Ok(t)  =>
+//             match syslog5424.format_timestamp(t)
+//                 Ok(s)   => println(s)
+//                 Err(e2) => println(e2.message())   // no year
+//         Err(e) => println(e.message())
+// ```
+pub fn format_timestamp(t: SyslogTimestamp) -> Result<Str, SyslogError>
+    todo("syslog-nv.syslog5424.format_timestamp")
+
+// The header field lengths of § 6.2, as a value.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     let limits = syslog5424.field_limits()
+//     println("${limits.app_name}")      // 48
+//     println("${limits.msgid}")         // 32
+// ```
+pub fn field_limits() -> SyslogFieldLimits
+    todo("syslog-nv.syslog5424.field_limits")
+
+// Whether every character is printable US-ASCII, %d33 to %d126.
+//
+// The rule RFC 5424 § 6 puts on the five header fields.  Note what it
+// excludes: the space, which is what separates the fields, and every
+// control character, and every octet above 126.  A hostname with a
+// space in it is the common case and it is fatal, because a receiver
+// would read the rest of that hostname as the application name and
+// everything after it would be shifted by one field.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     let ok = syslog5424.is_printable_ascii("mymachine.example.com")
+//     let no = syslog5424.is_printable_ascii("my machine")
+//     println("${ok}")                   // true
+//     println("${no}")                   // false
+// ```
+pub fn is_printable_ascii(text: Str) -> Bool
+    todo("syslog-nv.syslog5424.is_printable_ascii")
+
+// The byte order mark, `EF BB BF`.
+//
+// The three octets RFC 5424 § 6.4 requires in front of a MSG encoded
+// in UTF-8.  `parse` removes it and `format` writes it, so a caller
+// needs this only to recognise one in octets it got from somewhere
+// else.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     println("${list.len(syslog5424.bom())}")    // 3
+// ```
+pub fn bom() -> [u8]
+    todo("syslog-nv.syslog5424.bom")
+
+// The VERSION this format has, which is `1`.
+//
+// RFC 5424 § 6.2.2 defines one version and says a new one is assigned
+// only when the header changes.  It is a function rather than a
+// literal in the parser so that the number a caller compares against is
+// the number the formatter writes.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     println("${syslog5424.version()}")          // 1
+// ```
+pub fn version() -> Int
+    todo("syslog-nv.syslog5424.version")
+
+// The 480 octets RFC 5424 § 6.1 says every receiver must support.
+//
+// Advice about the network, not a limit this package applies: nothing
+// here refuses a longer message.  It is the number a sender uses when
+// it has to decide what to truncate, and the reason a long message
+// arrives cut in half at a receiver that supports no more than the
+// minimum.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     println("${syslog5424.minimum_supported_octets()}")   // 480
+// ```
+pub fn minimum_supported_octets() -> Int
+    todo("syslog-nv.syslog5424.minimum_supported_octets")
+
+// The 2048 octets RFC 5424 § 6.1 says a receiver should support.
+//
+// The other half of the same advice.  A sender that stays under this
+// gets through most deployments; one that stays under
+// `minimum_supported_octets` gets through all of them.
+//
+// ```novo
+// use syslog5424
+//
+// fn main() [io]
+//     println("${syslog5424.recommended_supported_octets()}")   // 2048
+// ```
+pub fn recommended_supported_octets() -> Int
+    todo("syslog-nv.syslog5424.recommended_supported_octets")
