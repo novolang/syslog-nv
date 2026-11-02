@@ -1,7 +1,5 @@
 // syslog5424.nv — the modern format, read and written.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE GRAMMAR, IN ONE LINE
 //
 // RFC 5424 § 6.1 writes a message as a header, a space, the structured
@@ -48,7 +46,336 @@
 // a longer RFC 5424 message, because the transport is what decides.
 
 use syslogmsg
+use syslogsd
 use syslogerror
+use syslogpri
+
+// Whether a byte is an ASCII digit.
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// The byte at an offset of some octets, or -1 past the end.
+fn byte_at(octets: [u8], i: Int) -> Int
+    if i < 0 or i >= list.len(octets)
+        return -1
+    octets[i] as Int
+
+// The byte at an offset of a `Str`, or -1 past the end.
+fn char_at(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, -1)
+
+// The octets of a message as plain `Int`s, which is the shape
+// `bytes.byte_list_to_str` and `bytes.from_byte_list` read.
+fn byte_ints(octets: [u8]) -> [Int]
+    list.map(octets, b => b as Int)
+
+// The text of the octets from `from` up to `to`.
+//
+// The header fields are ASCII (RFC 5424 § 6.2), so the octets are the
+// characters and nothing has to be decoded on the way in.
+fn text_of(octets: [u8], from: Int, to: Int) -> Str
+    var ints = [] as [Int]
+    var i = from
+    while i < to
+        ints = list.push(ints, byte_at(octets, i))
+        i += 1
+    bytes.byte_list_to_str(ints)
+
+// The octet where the space-delimited header field starting at `from`
+// ends.
+//
+// A header field cannot hold the space that separates it from the next
+// one (§ 6.2), so the field runs to the next space or to the end of the
+// octets, whichever comes first.
+fn field_end(octets: [u8], from: Int) -> Int
+    var i = from
+    let n = list.len(octets)
+    while i < n and byte_at(octets, i) != ' '
+        i += 1
+    i
+
+// The five field names of § 6.1, in the order they follow the VERSION.
+fn header_field_names() -> [Str]
+    ["TIMESTAMP", "HOSTNAME", "APP-NAME", "PROCID", "MSGID"]
+
+// A header field read as its value: the NILVALUE `-` says the sender
+// has none, which is the empty string here.
+fn field_value(text: Str) -> Str
+    if text == "-"
+        return ""
+    text
+
+// A header field as it is written: a field the sender has none of is
+// the NILVALUE and never an empty field, because § 6.2 gives every one
+// of them a minimum length of one.
+fn written_field(value: Str) -> Str
+    if value == ""
+        return "-"
+    value
+
+// A TIMESTAMP field: the NILVALUE is `None`, and anything else has to
+// be § 6.2.3's syntax.
+fn timestamp_field(text: Str) -> Result<?SyslogTimestamp, SyslogError>
+    if text == "-"
+        return Ok(None)
+    let parsed = parse_timestamp(text)
+    let t = parsed!
+    Ok(Some(t))
+
+// The decimal digits of `count` characters at `from`, or -1 when they
+// are not all digits or the character after them is not `sep`.
+//
+// A `sep` below zero asks for no separator at all, which is how the
+// last field of a run ends.
+fn fixed_int(text: Str, from: Int, count: Int, sep: Int) -> Int
+    var value = 0
+    var k = 0
+    while k < count
+        let b = char_at(text, from + k)
+        if not is_digit(b)
+            return -1
+        value = value * 10 + (b - '0')
+        k += 1
+    if sep >= 0 and char_at(text, from + count) != sep
+        return -1
+    value
+
+// Ten to the `k`, for the six fractional digits § 6.2.3.1 allows.
+fn pow10(k: Int) -> Int
+    var v = 1
+    var i = 0
+    while i < k
+        v = v * 10
+        i += 1
+    v
+
+// How many decimal digits a value needs, the number 0 being one digit.
+//
+// The one caller is `format_timestamp`'s refusal of a fraction over six
+// digits, which is a value above a million: its argument is positive
+// there, so there is no sign to take off.
+fn digit_count(n: Int) -> Int
+    var m = n
+    var digits = 1
+    while m >= 10
+        m = m / 10
+        digits += 1
+    digits
+
+// A number written with `width` digits, zeros in front.
+fn padded(n: Int, width: Int) -> Str
+    str.pad_left(str.from_int(n), width, "0")
+
+// The fractional second as § 6.2.3.1 writes it: the six digits that
+// are there, and not the zeros that are not.
+fn fraction_text(micros: Int) -> Str
+    let six = padded(micros, 6)
+    var end = 6
+    while end > 0 and str.byte_at_or(six, end - 1, 0) == '0'
+        end -= 1
+    str.slice(six, 0, end)
+
+// The TIMESTAMP field of a message being written.
+fn timestamp_text(t: ?SyslogTimestamp) -> Result<Str, SyslogError>
+    match t
+        None    => Ok("-")
+        Some(x) => format_timestamp(x)
+
+// The MSG of a message whose header ends at `at`, and whether it is
+// UTF-8.
+//
+// RFC 5424 § 6.4 says a MSG that begins with the byte order mark
+// `EF BB BF` is UTF-8, and the mark is a declaration rather than
+// content, so it comes off here and the formatter writes it back.  A
+// MSG of no octets at all is a message with no MSG, which § 6.1 allows.
+fn split_message(octets: [u8], at: Int) -> ([u8], Bool)
+    let n = list.len(octets)
+    if at >= n
+        // Bound before the tuple, and the tuple's reader is what makes
+        // this necessary: with the cast written inline here, a `@test`
+        // that reads a message off this path dies of SIGSEGV in the
+        // first `list.concat` after it.  See
+        // codegen-llvm/an-inline-empty-list-cast-in-a-tuple-return-makes-a-later-list-concat-die
+        // and codegen-llvm/an-identity-cast-in-a-struct-literal-field-or-tuple-element-reads-as-empty.
+        let none = [] as [u8]
+        return (none, false)
+    let rest = list.slice(octets, at, n)
+    if byte_at(rest, 0) == 0xEF and byte_at(rest, 1) == 0xBB and byte_at(rest, 2) == 0xBF
+        return (list.slice(rest, 3, list.len(rest)), true)
+    (rest, false)
+
+// The header and the structured data of some octets, read after the
+// priority has been taken off.
+//
+// The answer's count is where the MSG begins: one past the space that
+// follows the structured data, or the length of the octets when there
+// is no MSG at all.
+fn header_after_pri(octets: [u8], pri: SyslogPri,
+                    from: Int) -> Result<(SyslogMessage, Int), SyslogError>
+    let n = list.len(octets)
+    // § 6.2.2: the VERSION is the token between the priority and the
+    // first space, and § 6.2.2 assigns exactly one, `1`.  What is found
+    // is in the refusal, so a log says which dialect turned up.
+    var i = from
+    while i < n and byte_at(octets, i) != ' '
+        i += 1
+    let found = text_of(octets, from, i)
+    if found != "1"
+        return Err(SyslogNotVersion1(found))
+    // The five fields, each one ending at the space after it.  An
+    // absent field is empty rather than the NILVALUE, and § 6.2 gives
+    // every one of them a minimum length of one.
+    var fields = [] as [Str]
+    // Where the TIMESTAMP field starts, kept for the refusal below: the
+    // faults of this header are reported at the octet they hold in the
+    // whole message, and `timestamp_field` reads one field and counts
+    // from the field.
+    let stamp_at = i + 1
+    var at = i + 1
+    let names = header_field_names()
+    for name in names
+        let end = field_end(octets, at)
+        if end == at
+            return Err(SyslogFieldEmpty(name))
+        list.push(fields, text_of(octets, at, end))
+        at = end + 1
+    let stamp = timestamp_field(fields[0])
+    match stamp
+        Err(SyslogBadTimestamp(o, why)) =>
+            return Err(SyslogBadTimestamp(stamp_at + o, why))
+        // The other fault the timestamp reader has, a fraction of more
+        // than six digits, carries no octet of its own to move.
+        Err(e)                          =>
+            return Err(e)
+        Ok(t)                           =>
+            // The structured-data field, read from where it starts.  A
+            // fault in it is reported at the octet it holds in the
+            // whole message, which is what every other offset here
+            // counts from.
+            let rest = list.slice(octets, at, n)
+            let sd = syslogsd.parse(rest)
+            match sd
+                Err(SyslogBadStructuredData(o, why)) =>
+                    return Err(SyslogBadStructuredData(at + o, why))
+                // cov: skip — `syslogsd.parse` answers that one fault and
+                // no other, so this arm keeps the match exhaustive and is
+                // never taken.
+                Err(e)                               =>
+                    return Err(e)
+                Ok((elements, used))                 =>
+                    let after_sd = at + used
+                    var msg_at = after_sd
+                    if after_sd < n
+                        // § 6.1: the MSG is there only after a space.
+                        if byte_at(octets, after_sd) != ' '
+                            return Err(SyslogBadStructuredData(after_sd, "a space after the structured data"))
+                        msg_at = after_sd + 1
+                    let hostname = field_value(fields[1])
+                    let app_name = field_value(fields[2])
+                    let procid = field_value(fields[3])
+                    let msgid = field_value(fields[4])
+                    // Bound before the literal: an inline `as [u8]`
+                    // cast written as a struct-literal field is stored
+                    // empty by the compiled leg; see
+                    // codegen-llvm/an-identity-cast-in-a-struct-literal-field-or-tuple-element-reads-as-empty.
+                    let no_msg = [] as [u8]
+                    let m = SyslogMessage {
+                        pri: pri,
+                        format: SyslogFormatRfc5424,
+                        timestamp: t,
+                        hostname: hostname,
+                        app_name: app_name,
+                        procid: procid,
+                        msgid: msgid,
+                        structured_data: elements,
+                        msg: no_msg,
+                        msg_utf8: false }
+                    Ok((m, msg_at))
+
+// The octets of some text.
+//
+// A `Str` and a `[u8]` are two different things and this is where one
+// becomes the other.
+fn text_octets(text: Str) -> [u8]
+    let marked = bytes.from_str(text)
+    bytes.to_byte_list(marked)
+
+// The separator § 6.4 writes before a MSG, from whether the MSG is
+// UTF-8 rather than from the message that carries it.
+//
+// A message with no MSG has no separator either, and the two facts come
+// in as values so that the caller never reads a field after a call.
+fn separator_for(utf8: Bool, body_len: Int) -> Str
+    if body_len == 0
+        return ""
+    if utf8
+        return " " + bytes.byte_list_to_str(byte_ints(bom()))
+    " "
+
+// The header of a message being written: the priority, the version, and
+// the five fields § 6.2 orders after them, then the structured data.
+//
+// Every part arrives as text — the fields through `written_field` and
+// the structured data through `syslogsd.format` — so this function
+// takes no message.
+fn header_text(pri: SyslogPri, stamp: Str, hostname: Str, app_name: Str, procid: Str, msgid: Str,
+               sd: Str) -> Str
+    let sb = str.builder_new()
+    str.builder_append(sb, syslogpri.format_pri(pri))
+    str.builder_append(sb, str.from_int(version()))
+    let fields = [stamp, hostname, app_name, procid, msgid]
+    for f in fields
+        str.builder_append(sb, " ")
+        str.builder_append(sb, f)
+    str.builder_append(sb, " ")
+    str.builder_append(sb, sd)
+    let head = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    head
+
+// A written message's octets: the header's, then the separator's, then
+// the content's.
+//
+// The three arrive as plain values rather than as a message, because
+// the separator depends on whether the content is UTF-8 and on whether
+// there is any at all — the caller knows both from the message before
+// it hands the content over.
+fn joined(head: Str, separator: Str, body: [u8]) -> [u8]
+    let head_octets = text_octets(head)
+    let sep_octets = text_octets(separator)
+    let marked = list.concat(head_octets, sep_octets)
+    list.concat(marked, body)
+
+// One RFC 5424 message written out, with `syslogmsg.check` already
+// answered.
+fn write_message(m: SyslogMessage) -> Result<[u8], SyslogError>
+    let stamp = timestamp_text(m.timestamp)
+    match stamp
+        Err(e)         =>
+            return Err(e)
+        Ok(stamp_text) =>
+            let formatted = syslogsd.format(m.structured_data)
+            match formatted
+                Err(e)      =>
+                    // cov: skip — `syslogsd.format` refuses only what
+                    // `syslogsd.check` refuses, and `format` answered
+                    // that call before it came here, so this arm cannot
+                    // be the one a caller sees.
+                    return Err(e)
+                Ok(sd_text) =>
+                    let hostname_text = written_field(m.hostname)
+                    let app_name_text = written_field(m.app_name)
+                    let procid_text = written_field(m.procid)
+                    let msgid_text = written_field(m.msgid)
+                    let head = header_text(m.pri,
+                        stamp_text,
+                        hostname_text,
+                        app_name_text,
+                        procid_text,
+                        msgid_text,
+                        sd_text)
+                    let separator = separator_for(m.msg_utf8, list.len(m.msg))
+                    Ok(joined(head, separator, m.msg))
 
 // How long RFC 5424 § 6.2 lets each header field be, in octets.
 //
@@ -94,7 +421,24 @@ pub struct SyslogFieldLimits
 //         Err(e) => println(syslogerror.code(e))
 // ```
 pub fn parse(octets: [u8]) -> Result<SyslogMessage, SyslogError>
-    todo("syslog-nv.syslog5424.parse")
+    let header = parse_header(octets)
+    match header
+        Err(e)      =>
+            return Err(e)
+        Ok((m, at)) =>
+            let (msg, utf8) = split_message(octets, at)
+            let full = SyslogMessage {
+                pri: m.pri,
+                format: m.format,
+                timestamp: m.timestamp,
+                hostname: m.hostname,
+                app_name: m.app_name,
+                procid: m.procid,
+                msgid: m.msgid,
+                structured_data: m.structured_data,
+                msg: msg,
+                msg_utf8: utf8 }
+            Ok(full)
 
 // The header and the structured data only, and how many octets they
 // took.
@@ -117,7 +461,9 @@ pub fn parse(octets: [u8]) -> Result<SyslogMessage, SyslogError>
 //         Err(e)     => println(e.message())
 // ```
 pub fn parse_header(octets: [u8]) -> Result<(SyslogMessage, Int), SyslogError>
-    todo("syslog-nv.syslog5424.parse_header")
+    let parsed = syslogpri.parse_pri(octets)
+    let (pri, at) = parsed!
+    header_after_pri(octets, pri, at)
 
 // One whole RFC 5424 message, written.
 //
@@ -144,7 +490,13 @@ pub fn parse_header(octets: [u8]) -> Result<(SyslogMessage, Int), SyslogError>
 //         Err(e)     => println(e.message())
 // ```
 pub fn format(m: SyslogMessage) -> Result<[u8], SyslogError>
-    todo("syslog-nv.syslog5424.format")
+    let checked = syslogmsg.check(m)
+    match checked
+        Some(e) => Err(e)
+        None    =>
+            let written = write_message(m)
+            let octets = written!
+            Ok(octets)
 
 // An RFC 5424 TIMESTAMP, parsed.
 //
@@ -167,7 +519,60 @@ pub fn format(m: SyslogMessage) -> Result<[u8], SyslogError>
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_timestamp(text: Str) -> Result<SyslogTimestamp, SyslogError>
-    todo("syslog-nv.syslog5424.parse_timestamp")
+    let year = fixed_int(text, 0, 4, '-')
+    let month = fixed_int(text, 5, 2, '-')
+    let day = fixed_int(text, 8, 2, 'T')
+    if year < 0 or month < 0 or day < 0
+        return Err(SyslogBadTimestamp(0, "FULL-DATE"))
+    let hour = fixed_int(text, 11, 2, ':')
+    let minute = fixed_int(text, 14, 2, ':')
+    let second = fixed_int(text, 17, 2, -1)
+    if hour < 0 or minute < 0 or second < 0
+        return Err(SyslogBadTimestamp(11, "FULL-TIME"))
+    var at = 19
+    var micros = 0
+    // § 6.2.3.1: the fraction is optional, and its DIGITS are what is
+    // capped rather than its value — a seventh digit is not another
+    // way of writing the same fraction.
+    if char_at(text, at) == '.'
+        at += 1
+        let start = at
+        while is_digit(char_at(text, at))
+            at += 1
+        let digits = at - start
+        if digits == 0
+            return Err(SyslogBadTimestamp(start, "TIME-SECFRAC"))
+        if digits > 6
+            return Err(SyslogTimestampTooPrecise(digits))
+        let fraction = fixed_int(text, start, digits, -1)
+        micros = fraction * pow10(6 - digits)
+    var offset = 0
+    let sign = char_at(text, at)
+    if sign == 'Z'
+        // The one offset an RFC 5424 timestamp may spell, and it is
+        // zero rather than absent.
+        at += 1
+    elif sign == '+' or sign == '-'
+        let hours = fixed_int(text, at + 1, 2, ':')
+        let minutes = fixed_int(text, at + 4, 2, -1)
+        if hours < 0 or minutes < 0
+            return Err(SyslogBadTimestamp(at, "TIME-OFFSET"))
+        let total = hours * 60 + minutes
+        // TIME-NUMOFFSET's parts are TIME-HOUR and TIME-MINUTE, so
+        // 23:59 is as far from UTC as this syntax can say.
+        if total > 1439
+            return Err(SyslogBadTimestamp(at, "TIME-OFFSET"))
+        if sign == '-'
+            offset = -total
+        else
+            offset = total
+        // The sign and the two `HH:MM` halves are six characters.
+        at += 6
+    else
+        return Err(SyslogBadTimestamp(at, "TIME-OFFSET"))
+    if at != str.len(text)
+        return Err(SyslogBadTimestamp(at, "the end of the TIMESTAMP"))
+    syslogmsg.timestamp(Some(year), month, day, hour, minute, second, micros, Some(offset))
 
 // A timestamp written the way § 6.2.3 writes one.
 //
@@ -194,7 +599,45 @@ pub fn parse_timestamp(text: Str) -> Result<SyslogTimestamp, SyslogError>
 //         Err(e) => println(e.message())
 // ```
 pub fn format_timestamp(t: SyslogTimestamp) -> Result<Str, SyslogError>
-    todo("syslog-nv.syslog5424.format_timestamp")
+    var year = 0
+    match t.year
+        None    =>
+            return Err(SyslogTimestampIncomplete("year"))
+        Some(y) =>
+            year = y
+    // § 6.2.3's FULL-DATE is exactly four digits, so there is no
+    // spelling for a year outside them.
+    if year < 0 or year > 9999
+        return Err(SyslogBadTimestamp(-1, "a four-digit year"))
+    var offset = 0
+    match t.offset_minutes
+        None    =>
+            return Err(SyslogTimestampIncomplete("offset"))
+        Some(o) =>
+            offset = o
+    if offset < -1439 or offset > 1439
+        return Err(SyslogBadTimestamp(-1, "an offset of at most 23:59 either side of UTC"))
+    // A timestamp's own parts are settled where a caller builds it
+    // (`syslogmsg.timestamp`), so what is left here is the fraction's
+    // DIGIT count, which is what § 6.2.3.1 caps.
+    if t.micros < 0
+        return Err(SyslogBadTimestamp(-1, "a fractional second of zero or more"))
+    if t.micros > 999999
+        return Err(SyslogTimestampTooPrecise(digit_count(t.micros)))
+    var text = padded(year, 4) + "-" + padded(t.month, 2) + "-" + padded(t.day, 2)
+    text = text + "T" + padded(t.hour, 2) + ":" + padded(t.minute, 2) + ":" + padded(t.second, 2)
+    if t.micros > 0
+        text = text + "." + fraction_text(t.micros)
+    // A zero offset is written `Z`, which is the same instant and one
+    // octet shorter.
+    if offset == 0
+        return Ok(text + "Z")
+    var magnitude = offset
+    var sign = "+"
+    if offset < 0
+        sign = "-"
+        magnitude = -offset
+    Ok(text + sign + padded(magnitude / 60, 2) + ":" + padded(magnitude % 60, 2))
 
 // The header field lengths of § 6.2, as a value.
 //
@@ -207,7 +650,7 @@ pub fn format_timestamp(t: SyslogTimestamp) -> Result<Str, SyslogError>
 //     println("${limits.msgid}")         // 32
 // ```
 pub fn field_limits() -> SyslogFieldLimits
-    todo("syslog-nv.syslog5424.field_limits")
+    SyslogFieldLimits { hostname: 255, app_name: 48, procid: 128, msgid: 32 }
 
 // Whether every character is printable US-ASCII, %d33 to %d126.
 //
@@ -228,7 +671,14 @@ pub fn field_limits() -> SyslogFieldLimits
 //     println("${no}")                   // false
 // ```
 pub fn is_printable_ascii(text: Str) -> Bool
-    todo("syslog-nv.syslog5424.is_printable_ascii")
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = char_at(text, i)
+        if b < 33 or b > 126
+            return false
+        i += 1
+    true
 
 // The byte order mark, `EF BB BF`.
 //
@@ -244,7 +694,7 @@ pub fn is_printable_ascii(text: Str) -> Bool
 //     println("${list.len(syslog5424.bom())}")    // 3
 // ```
 pub fn bom() -> [u8]
-    todo("syslog-nv.syslog5424.bom")
+    [0xEF as u8, 0xBB as u8, 0xBF as u8]
 
 // The VERSION this format has, which is `1`.
 //
@@ -260,7 +710,7 @@ pub fn bom() -> [u8]
 //     println("${syslog5424.version()}")          // 1
 // ```
 pub fn version() -> Int
-    todo("syslog-nv.syslog5424.version")
+    1
 
 // The 480 octets RFC 5424 § 6.1 says every receiver must support.
 //
@@ -277,7 +727,7 @@ pub fn version() -> Int
 //     println("${syslog5424.minimum_supported_octets()}")   // 480
 // ```
 pub fn minimum_supported_octets() -> Int
-    todo("syslog-nv.syslog5424.minimum_supported_octets")
+    480
 
 // The 2048 octets RFC 5424 § 6.1 says a receiver should support.
 //
@@ -292,4 +742,4 @@ pub fn minimum_supported_octets() -> Int
 //     println("${syslog5424.recommended_supported_octets()}")   // 2048
 // ```
 pub fn recommended_supported_octets() -> Int
-    todo("syslog-nv.syslog5424.recommended_supported_octets")
+    2048

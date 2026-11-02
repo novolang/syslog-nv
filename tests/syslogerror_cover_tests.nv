@@ -1,0 +1,175 @@
+// syslogerror_cover_tests.nv — every reason, through every one of the
+// four functions that classify it.
+//
+// Added while landing the package.  The four API suites meet the
+// variants their own fixtures produce; none of them calls `message()`
+// at all, and each one exercises a handful of the twenty-one.  This
+// suite builds one value per variant and asks all four functions about
+// it, so that the taxonomy is asserted whole rather than in the parts
+// the example messages happened to touch.
+
+use std.test
+use syslogerror
+
+@test
+fn test_every_reason_answers_a_code_and_a_place() [io]
+    // `code` is the metric label and `offset_of` is the position, and
+    // both are asserted against a value built here rather than one a
+    // parser happened to produce.
+    test.case("a priority that is not a priority is at octet 7")
+    let bad_pri = SyslogBadPri(7)
+    test.assert(syslogerror.code(bad_pri) == "bad_pri")
+    test.assert(syslogerror.offset_of(bad_pri) == 7)
+    test.assert(str.contains(bad_pri.message(), "no priority at octet 7"))
+
+    test.case("a value above 191 has no octet, because it names no place")
+    let too_large = SyslogPriValueTooLarge(192)
+    test.assert(syslogerror.code(too_large) == "pri_value_too_large")
+    test.assert(syslogerror.offset_of(too_large) == -1)
+    test.assert(str.contains(too_large.message(), "above 191"))
+
+    test.case("a leading zero is positional: it is the second octet")
+    let leading = SyslogPriHasLeadingZero(1)
+    test.assert(syslogerror.code(leading) == "pri_has_leading_zero")
+    test.assert(syslogerror.offset_of(leading) == 1)
+    test.assert(str.contains(leading.message(), "leading zero"))
+
+    test.case("a version that is not 1 carries the word it found")
+    let version = SyslogNotVersion1("0")
+    test.assert(syslogerror.code(version) == "not_version_1")
+    test.assert(syslogerror.offset_of(version) == -1)
+    test.assert(str.contains(version.message(), "VERSION is `0`"))
+
+    test.case("a bad timestamp carries the octet and the part that failed")
+    let stamp = SyslogBadTimestamp(4, "FULL-DATE")
+    test.assert(syslogerror.code(stamp) == "bad_timestamp")
+    test.assert(syslogerror.offset_of(stamp) == 4)
+    test.assert(str.contains(stamp.message(), "at octet 4 is not FULL-DATE"))
+
+    test.case("too much precision names the digit count, not a place")
+    let precise = SyslogTimestampTooPrecise(9)
+    test.assert(syslogerror.code(precise) == "timestamp_too_precise")
+    test.assert(syslogerror.offset_of(precise) == -1)
+    test.assert(str.contains(precise.message(), "9 fractional digits"))
+
+    test.case("an incomplete timestamp names the part that is missing")
+    let incomplete = SyslogTimestampIncomplete("year")
+    test.assert(syslogerror.code(incomplete) == "timestamp_incomplete")
+    test.assert(syslogerror.offset_of(incomplete) == -1)
+    test.assert(str.contains(incomplete.message(), "needs a year"))
+
+    test.case("an over-long field names the field and both counts")
+    let long = SyslogFieldTooLong("HOSTNAME", 300, 255)
+    test.assert(syslogerror.code(long) == "field_too_long")
+    test.assert(syslogerror.offset_of(long) == -1)
+    test.assert(str.contains(long.message(), "HOSTNAME is 300 octets and the limit is 255"))
+
+    test.case("an unprintable field names the field and the octet")
+    let unprintable = SyslogFieldNotPrintable("APP-NAME", 12)
+    test.assert(syslogerror.code(unprintable) == "field_not_printable")
+    test.assert(syslogerror.offset_of(unprintable) == 12)
+    test.assert(str.contains(unprintable.message(), "outside PRINTUSASCII at octet 12"))
+
+    test.case("an empty field names itself")
+    let empty = SyslogFieldEmpty("PROCID")
+    test.assert(syslogerror.code(empty) == "field_empty")
+    test.assert(syslogerror.offset_of(empty) == -1)
+    test.assert(str.contains(empty.message(), "PROCID is empty"))
+
+    test.case("malformed structured data carries the octet and what was expected")
+    let sd = SyslogBadStructuredData(20, "]")
+    test.assert(syslogerror.code(sd) == "bad_structured_data")
+    test.assert(syslogerror.offset_of(sd) == 20)
+    test.assert(str.contains(sd.message(), "structured data at octet 20"))
+
+    test.case("a name that is not an SD-NAME is quoted back")
+    let name = SyslogSdNameInvalid("a b")
+    test.assert(syslogerror.code(name) == "sd_name_invalid")
+    test.assert(syslogerror.offset_of(name) == -1)
+    test.assert(str.contains(name.message(), "`a b` is not an SD-NAME"))
+
+    test.case("a repeated SD-ID is the id itself, and there is no octet")
+    let repeated = SyslogSdIdRepeated("meta")
+    test.assert(syslogerror.code(repeated) == "sd_id_repeated")
+    test.assert(syslogerror.offset_of(repeated) == -1)
+    test.assert(str.contains(repeated.message(), "`meta` appears twice"))
+
+    test.case("a bare SD-ID that is not one of the three is refused by name")
+    let unregistered = SyslogSdIdNotRegistered("exampleSDID")
+    test.assert(syslogerror.code(unregistered) == "sd_id_not_registered")
+    test.assert(syslogerror.offset_of(unregistered) == -1)
+    test.assert(str.contains(unregistered.message(), "the bare SD-ID `exampleSDID` is not one of"))
+
+    test.case("an over-long TAG carries the octet it was found at")
+    let tag = SyslogBadTag(-1)
+    test.assert(syslogerror.code(tag) == "bad_tag")
+    test.assert(syslogerror.offset_of(tag) == -1)
+    test.assert(str.contains(tag.message(), "the TAG at octet -1"))
+
+    test.case("an over-long RFC 3164 message names both sizes")
+    let long_message = SyslogMessageTooLong(2000, 1024)
+    test.assert(syslogerror.code(long_message) == "message_too_long")
+    test.assert(syslogerror.offset_of(long_message) == -1)
+    test.assert(str.contains(long_message.message(), "2000 octets is over the 1024"))
+
+    test.case("octets declared UTF-8 that are not name the octet")
+    let utf8 = SyslogMsgNotUtf8(40)
+    test.assert(syslogerror.code(utf8) == "msg_not_utf8")
+    test.assert(syslogerror.offset_of(utf8) == 40)
+    test.assert(str.contains(utf8.message(), "octet 40 is not"))
+
+    test.case("a MSG-LEN that is not a length carries its octet")
+    let bad_len = SyslogBadFrameLength(0)
+    test.assert(syslogerror.code(bad_len) == "bad_frame_length")
+    test.assert(syslogerror.offset_of(bad_len) == 0)
+    test.assert(str.contains(bad_len.message(), "the MSG-LEN at octet 0"))
+
+    test.case("a frame over the limit names both sizes and no octet")
+    let too_big = SyslogFrameTooLarge(481, 480)
+    test.assert(syslogerror.code(too_big) == "frame_too_large")
+    test.assert(syslogerror.offset_of(too_big) == -1)
+    test.assert(str.contains(too_big.message(), "a frame of 481 octets is over the reader's limit of 480"))
+
+    test.case("a truncated frame says where the stream ended")
+    let truncated = SyslogFrameTruncated(4812)
+    test.assert(syslogerror.code(truncated) == "frame_truncated")
+    test.assert(syslogerror.offset_of(truncated) == 4812)
+    test.assert(str.contains(truncated.message(), "ended at octet 4812"))
+
+    test.case("a trailer inside a message is positional")
+    let trailer = SyslogTrailerInMessage(5)
+    test.assert(syslogerror.code(trailer) == "trailer_in_message")
+    test.assert(syslogerror.offset_of(trailer) == 5)
+    test.assert(str.contains(trailer.message(), "octet 5 is the trailer"))
+
+@test
+fn test_the_framing_division_runs_through_every_reason() [io]
+    // The five that cost the connection and the sixteen that cost one
+    // message, asked of each value rather than read off the doc
+    // comment: `is_framing_fault` is the function a receiver's loop is
+    // built on, and a variant added to the enum without a decision here
+    // would be one a receiver had no answer for.
+    test.case("the five that cost the connection")
+    test.assert(syslogerror.is_framing_fault(SyslogBadFrameLength(0)))
+    test.assert(syslogerror.is_framing_fault(SyslogFrameTooLarge(481, 480)))
+    test.assert(syslogerror.is_framing_fault(SyslogFrameTruncated(4812)))
+    test.assert(syslogerror.is_framing_fault(SyslogTrailerInMessage(5)))
+    test.assert(syslogerror.is_framing_fault(SyslogMessageTooLong(2000, 1024)))
+
+    test.case("and the sixteen that cost one message")
+    test.assert(not syslogerror.is_framing_fault(SyslogBadPri(0)))
+    test.assert(not syslogerror.is_framing_fault(SyslogPriValueTooLarge(192)))
+    test.assert(not syslogerror.is_framing_fault(SyslogPriHasLeadingZero(1)))
+    test.assert(not syslogerror.is_framing_fault(SyslogNotVersion1("0")))
+    test.assert(not syslogerror.is_framing_fault(SyslogBadTimestamp(4, "FULL-DATE")))
+    test.assert(not syslogerror.is_framing_fault(SyslogTimestampTooPrecise(9)))
+    test.assert(not syslogerror.is_framing_fault(SyslogTimestampIncomplete("year")))
+    test.assert(not syslogerror.is_framing_fault(SyslogFieldTooLong("HOSTNAME", 300, 255)))
+    test.assert(not syslogerror.is_framing_fault(SyslogFieldNotPrintable("APP-NAME", 12)))
+    test.assert(not syslogerror.is_framing_fault(SyslogFieldEmpty("PROCID")))
+    test.assert(not syslogerror.is_framing_fault(SyslogBadStructuredData(20, "]")))
+    test.assert(not syslogerror.is_framing_fault(SyslogSdNameInvalid("a b")))
+    test.assert(not syslogerror.is_framing_fault(SyslogSdIdRepeated("meta")))
+    test.assert(not syslogerror.is_framing_fault(SyslogSdIdNotRegistered("exampleSDID")))
+    test.assert(not syslogerror.is_framing_fault(SyslogBadTag(-1)))
+    test.assert(not syslogerror.is_framing_fault(SyslogMsgNotUtf8(40)))

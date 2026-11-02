@@ -1,9 +1,8 @@
 // syslogframe_tests.nv — the API suite for the reader.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// syslog-nv.syslogframe.<fn>`.  What is asserted is the two framings of
-// RFC 6587 § 3.4 and the one division the package is built on — a fault
-// that costs one message against a fault that costs the connection.
+// What is asserted is the two framings of RFC 6587 § 3.4 and the one
+// division the package is built on — a fault that costs one message
+// against a fault that costs the connection.
 
 use std.test
 use syslogframe
@@ -60,7 +59,7 @@ fn test_octet_counting_takes_exactly_the_octets_the_length_declared() [io]
     // message is ordinary content — which is the whole reason this
     // framing exists.
     test.case("`7 <13>abc` is one seven-octet message")
-    match syslogframe.feed(counting_reader(), octets_of("7 <13>ab"))
+    match syslogframe.feed(counting_reader(), octets_of("7 <13>abc"))
         Err(_)  => test.fail("that is a well-formed frame")
         Ok(fed) =>
             match fed.frame

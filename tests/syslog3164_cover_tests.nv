@@ -1,0 +1,271 @@
+// syslog3164_cover_tests.nv — the refusals and the writing paths the API
+// suite leaves open.
+//
+// Added while landing the package.  The API suite proves this module
+// reads RFC 3164 § 5.4's examples; a reader is judged by the octets a
+// sender got wrong and by what it writes back, so every refusal of the
+// strict reader, every refusal of the timestamp reader, and every part
+// of a written header is provoked here on its own.
+
+use std.test
+use syslog3164
+use syslogmsg
+use syslogpri
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+// The octet the strict reader refuses at, or -1 when it read the message.
+fn fault_at(text: Str) -> Int
+    match syslog3164.parse(octets_of(text))
+        Ok(_)  => -1
+        Err(e) => syslogerror.offset_of(e)
+
+// The octet the timestamp reader refuses at, or -1 when it read the text.
+fn stamp_fault_at(text: Str) -> Int
+    match syslog3164.parse_timestamp(text)
+        Ok(_)  => -1
+        Err(e) => syslogerror.offset_of(e)
+
+// A message of the shape this format writes, so that a case can vary the
+// one part it is about.
+fn bsd_message(app: Str, host: Str, procid: Str, stamp: ?SyslogTimestamp) -> SyslogMessage
+    let no_sd = [] as [SyslogSdElement]
+    let body = octets_of("hello")
+    SyslogMessage {
+        pri: syslogpri.pri(SyslogFacUser, SyslogSevNotice),
+        format: SyslogFormatRfc3164,
+        timestamp: stamp,
+        hostname: host,
+        app_name: app,
+        procid: procid,
+        msgid: "",
+        structured_data: no_sd,
+        msg: body,
+        msg_utf8: false }
+
+// Forty alphanumeric characters: more than § 4.1.3's thirty-two.
+fn long_tag() -> Str
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
+
+@test
+fn test_the_strict_reader_refuses_a_header_it_cannot_read() [io]
+    // Each refusal is asserted at the octet a person reading the log
+    // would be sent to, counted from the first octet of the message.
+    test.case("a header with no room for a timestamp")
+    // Four octets of PRI, then ten: § 4.1.2's timestamp is fifteen.
+    test.assert(fault_at("<34>Oct 11") == 4)
+
+    test.case("a month that is no month abbreviation")
+    // The refusal is about the whole fifteen characters, so it is
+    // reported where the timestamp starts.
+    test.assert(fault_at("<34>Xxx 11 22:14:15 host tag: x") == 4)
+
+    test.case("a TAG longer than the thirty-two § 4.1.3 allows")
+    match syslog3164.parse(octets_of("<34>Oct 11 22:14:15 host " + long_tag() + ": x"))
+        Ok(_)                 => test.fail("a forty-character TAG is not one § 4.1.3 allows")
+        Err(SyslogBadTag(at)) =>
+            // Not positional: a TAG one character over the cap is the
+            // whole TAG's fault.
+            test.assert(at == -1)
+        Err(_)                => test.fail("a long TAG is a TAG fault")
+
+    test.case("and a message over the 1024-octet cap of § 4.1")
+    let big = str.builder_new()
+    str.builder_append(big, "<34>Oct 11 22:14:15 host tag: ")
+    var k = 0
+    while k < 1000
+        str.builder_append(big, "x")
+        k += 1
+    let long = str.builder_to_str(big)
+    str.builder_drop(big)
+    let octets = octets_of(long)
+    match syslog3164.parse(octets)
+        Ok(_)                             => test.fail("that message is over 1024 octets")
+        Err(SyslogMessageTooLong(n, max)) =>
+            test.assert(n == list.len(octets))
+            test.assert(max == syslog3164.max_message_octets())
+        Err(_)                            => test.fail("the cap is a length fault")
+
+@test
+fn test_the_bsd_timestamp_reader_refuses_each_part_that_is_out_of_shape() [io]
+    // § 4.1.2's field is exactly fifteen characters; every way of
+    // getting one of them wrong is answered with the character it is
+    // about, and each case below is one way.
+    test.case("fourteen characters instead of fifteen")
+    match syslog3164.parse_timestamp("Oct 11 22:14:1")
+        Ok(_)  => test.fail("that is not a fifteen-character timestamp")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "bad_timestamp")
+            test.assert(stamp_fault_at("Oct 11 22:14:1") == 0)
+
+    test.case("a month that is not one of the twelve")
+    test.assert(stamp_fault_at("Xxx 11 22:14:15") == 0)
+
+    test.case("no space between the month and the day")
+    test.assert(stamp_fault_at("Oct-11 22:14:15") == 3)
+
+    test.case("a space-padded day whose second character is not a digit")
+    test.assert(stamp_fault_at("Oct  x 22:14:15") == 4)
+
+    test.case("a two-digit day whose second character is not a digit")
+    test.assert(stamp_fault_at("Oct 1x 22:14:15") == 4)
+
+    test.case("and a day that is neither a digit nor a space")
+    test.assert(stamp_fault_at("Oct xx 22:14:15") == 4)
+
+    test.case("no space between the day and the hour")
+    test.assert(stamp_fault_at("Oct 11x22:14:15") == 6)
+
+    test.case("a colon missing from hh:mm:ss")
+    test.assert(stamp_fault_at("Oct 11 22-14:15") == 7)
+
+    test.case("and a character of hh:mm:ss that is not a digit")
+    test.assert(stamp_fault_at("Oct 11 2x:14:15") == 7)
+
+@test
+fn test_the_relaxed_reader_keeps_what_it_cannot_read() [io]
+    // § 4.3.3 tells a relay to keep going: a message whose timestamp is
+    // not one is a message with no timestamp, not a dropped message.
+    let pri = syslog3164.default_pri()
+
+    test.case("a message with no room for a timestamp")
+    // What could not be read stays in the content, octet for octet:
+    // the PRI is consumed and everything after it is the message.
+    let m = syslog3164.parse_relaxed(octets_of("<34>Oct 11"), pri)
+    match m.timestamp
+        Some(_) => test.fail("there was no timestamp to read")
+        None    => test.assert(true)
+    test.assert(m.msg == octets_of("Oct 11"))
+    test.assert(syslogpri.prival(m.pri) == 34)
+
+    test.case("a timestamp that is not one, with a hostname after it")
+    let bad = syslog3164.parse_relaxed(octets_of("<34>Xxx 11 22:14:15 host tag: x"), pri)
+    match bad.timestamp
+        Some(_) => test.fail("Xxx is no month abbreviation")
+        None    => test.assert(true)
+
+    test.case("a timestamp with nothing at all after it")
+    // The space that would separate a hostname is not there, so the
+    // whole content, timestamp included, is the message.
+    let only = octets_of("<34>Oct 11 22:14:15")
+    let bare = syslog3164.parse_relaxed(only, pri)
+    match bare.timestamp
+        Some(_) => test.fail("a timestamp with no hostname is not read")
+        None    => test.assert(true)
+
+    test.case("a hostname field that is empty")
+    let empty = syslog3164.parse_relaxed(octets_of("<34>Oct 11 22:14:15  x"), pri)
+    test.assert(empty.hostname == "")
+
+    test.case("a TAG over the cap, which a relay cuts rather than refuses")
+    let capped = syslog3164.parse_relaxed(
+        octets_of("<34>Oct 11 22:14:15 host " + long_tag() + " rest"), pri)
+    test.assert(str.len(capped.app_name) == syslog3164.max_tag_chars())
+
+    test.case("and a bracketed number that is not `[` digits `]`")
+    let bracketed = syslog3164.parse_relaxed(octets_of("<34>Oct 11 22:14:15 host [abc]: x"), pri)
+    test.assert(bracketed.procid == "")
+    test.assert(bracketed.app_name == "")
+
+@test
+fn test_a_written_bsd_message_carries_back_everything_it_read() [io]
+    // The writing path of a message that holds everything § 4.1 has:
+    // a timestamp, a hostname and a TAG with a process identifier.  A
+    // parsed message written again is the octets it came in as.
+    let wire = "<34>Oct 11 22:14:15 mymachine su[1234]: 'su root' failed"
+    let octets = octets_of(wire)
+    match syslog3164.parse(octets)
+        Err(_) => test.fail("§ 5.4's first example with a process identifier")
+        Ok(m)  =>
+            match syslog3164.format(m)
+                Err(_)      => test.fail("that message checks out and is written")
+                Ok(written) =>
+                    // A message parsed and written again is the octets it
+                    // came in as, TAG separator and all.
+                    test.assert(written == octets)
+
+@test
+fn test_a_bsd_message_that_carries_an_instant_cannot_be_written() [io]
+    // § 4.1.2 has nowhere to put a year or a zone offset, so a message
+    // that carries either would go out naming another moment than the
+    // one it holds.  Both are refusals rather than a silent drop.
+    test.case("a timestamp with a year")
+    match syslogmsg.timestamp(Some(2026), 10, 11, 22, 14, 15, 0, None)
+        Err(_) => test.fail("that is a timestamp")
+        Ok(t)  =>
+            test.assert(no_year_and_no_offset_are_the_only_writable_stamps(t))
+
+    test.case("a timestamp with an offset and no year")
+    match syslogmsg.timestamp(None, 10, 11, 22, 14, 15, 0, Some(0))
+        Err(_) => test.fail("a year and an offset are independent parts")
+        Ok(t)  =>
+            test.assert(no_year_and_no_offset_are_the_only_writable_stamps(t))
+
+    test.case("while the timestamp § 4.1.2 writes goes out as it stands")
+    match syslog3164.parse_timestamp("Oct 11 22:14:15")
+        Err(_) => test.fail("that is § 4.1.2's own shape")
+        Ok(t)  =>
+            let m = bsd_message("su", "mymachine", "", Some(t))
+            match syslog3164.format(m)
+                Err(_) => test.fail("a stamped message of this format is written")
+                Ok(_)  => test.assert(true)
+
+// Whether the writer refuses a message stamped with `t`, which is what
+// it has to do when the stamp carries a year or an offset.
+fn no_year_and_no_offset_are_the_only_writable_stamps(t: SyslogTimestamp) -> Bool
+    let m = bsd_message("su", "mymachine", "", Some(t))
+    match syslog3164.format(m)
+        Ok(_)  => false
+        Err(e) => syslogerror.code(e) == "bad_timestamp"
+
+@test
+fn test_the_writer_refuses_a_tag_it_could_not_read_back() [io]
+    // § 4.1.3's TAG is alphanumeric and at most thirty-two characters.
+    // A writer that emitted anything else would produce a message this
+    // package's own reader would refuse.
+    let no_stamp = None as ?SyslogTimestamp
+
+    test.case("a TAG with a character that is not alphanumeric")
+    let bad_char = bsd_message("su-root", "mymachine", "", no_stamp)
+    match syslog3164.format(bad_char)
+        Ok(_)                 => test.fail("a hyphen is not allowed in a TAG")
+        Err(SyslogBadTag(at)) => test.assert(at == 2)
+        Err(_)                => test.fail("a TAG fault is a TAG fault")
+
+    test.case("a TAG over the thirty-two-character cap")
+    let too_long = bsd_message(long_tag(), "mymachine", "", no_stamp)
+    match syslog3164.format(too_long)
+        Ok(_)                 => test.fail("forty characters is over the cap")
+        Err(SyslogBadTag(at)) => test.assert(at == -1)
+        Err(_)                => test.fail("a TAG fault is a TAG fault")
+
+    test.case("while a TAG of exactly the cap goes through")
+    let at_cap = bsd_message("abcdefghijklmnopqrstuvwxyzABCDEF", "mymachine", "", no_stamp)
+    match syslog3164.format(at_cap)
+        Err(_) => test.fail("thirty-two characters is what § 4.1.3 allows")
+        Ok(_)  => test.assert(true)
+
+@test
+fn test_split_tag_cuts_the_tag_at_the_cap_it_documents() [io]
+    // § 4.1.3's cap, applied where the function's own documentation
+    // says it is applied: `split_tag` truncates, `parse` refuses.
+    let (tag, rest) = syslog3164.split_tag(octets_of(long_tag() + " rest"))
+    test.assert(str.len(tag) == syslog3164.max_tag_chars())
+    test.assert(list.len(rest) > 0)
+
+@test
+fn test_a_timestamp_whose_month_is_not_a_month_cannot_be_written() [io]
+    // The parts of a timestamp are settled by `syslogmsg.timestamp`, so
+    // a month this syntax cannot name arrives only through a value built
+    // by hand — which is exactly what a caller reading a damaged store
+    // has.  It is a refusal, not a crash and not `Jan`.
+    let crooked = SyslogTimestamp {
+        year: None, month: 13, day: 1, hour: 0, minute: 0, second: 0, micros: 0,
+        offset_minutes: None }
+    match syslog3164.format_timestamp(crooked)
+        Ok(_)  => test.fail("there is no thirteenth month abbreviation")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "bad_timestamp")
+            test.assert(syslogerror.offset_of(e) == -1)

@@ -1,9 +1,8 @@
 // syslog3164_tests.nv — the API suite for the BSD format.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// syslog-nv.syslog3164.<fn>`.  The fixtures are the example messages of
-// RFC 3164 § 5.4, including the two the section gives as things a relay
-// meets rather than as things a sender should write.
+// The fixtures are the example messages of RFC 3164 § 5.4, including
+// the two the section gives as things a relay meets rather than as
+// things a sender should write.
 
 use std.test
 use syslog3164

@@ -1,7 +1,5 @@
 // syslog3164.nv — the BSD format, read and written.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHAT RFC 3164 IS
 //
 // RFC 3164 does not specify syslog.  It was written in 2001 to write
@@ -59,6 +57,341 @@
 use syslogmsg
 use syslogpri
 use syslogerror
+use syslogsd
+
+// ── reading octets ───────────────────────────────────────────────────
+
+// Whether a byte is an ASCII digit.
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// Whether a byte is an ASCII letter, either case.
+fn is_letter(b: Int) -> Bool
+    b >= 'A' and b <= 'Z' or b >= 'a' and b <= 'z'
+
+// Whether a byte is one of the alphanumeric characters § 4.1.3 builds
+// the TAG out of.
+fn alphanumeric(b: Int) -> Bool
+    is_digit(b) or is_letter(b)
+
+// The byte at an offset of some octets, or -1 past the end.
+fn byte_at(octets: [u8], i: Int) -> Int
+    if i < 0 or i >= list.len(octets)
+        return -1
+    octets[i] as Int
+
+// The byte at an offset of a `Str`, or -1 past the end.
+fn char_at(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, -1)
+
+// The text of the octets from `from` up to `to`.
+//
+// RFC 3164 is ASCII, so the octets are the characters and nothing has
+// to be decoded on the way in.
+fn text_of(octets: [u8], from: Int, to: Int) -> Str
+    var ints = [] as [Int]
+    var i = from
+    while i < to
+        ints = list.push(ints, byte_at(octets, i))
+        i += 1
+    bytes.byte_list_to_str(ints)
+
+// The octet where the space-delimited field starting at `from` ends.
+//
+// § 4.1 gives the fields after the timestamp no spaces, so a field runs
+// to the next space or to the end of the octets, whichever comes first.
+fn field_end(octets: [u8], from: Int) -> Int
+    var i = from
+    let n = list.len(octets)
+    while i < n and byte_at(octets, i) != ' '
+        i += 1
+    i
+
+// The decimal digits of `count` characters at `from`, or -1 when they
+// are not all digits or the character after them is not `sep`.
+//
+// A `sep` below zero asks for no separator at all, which is how the
+// last field of a run ends.
+fn fixed_int(text: Str, from: Int, count: Int, sep: Int) -> Int
+    var value = 0
+    var k = 0
+    while k < count
+        let b = char_at(text, from + k)
+        if not is_digit(b)
+            return -1
+        value = value * 10 + (b - '0')
+        k += 1
+    if sep >= 0 and char_at(text, from + count) != sep
+        return -1
+    value
+
+// A number written with `width` digits, zeros in front.
+fn padded(n: Int, width: Int) -> Str
+    str.pad_left(str.from_int(n), width, "0")
+
+// ── the TAG and the content ──────────────────────────────────────────
+
+// How many alphanumeric characters the content starts with: the whole
+// run, and not the 32 § 4.1.3 allows of it.
+fn tag_run(content: [u8]) -> Int
+    var i = 0
+    let n = list.len(content)
+    while i < n and alphanumeric(byte_at(content, i))
+        i += 1
+    i
+
+// How many digits a bracketed number at `from` holds, or -1 when what
+// is there is not `[` digits `]`.
+fn bracketed_number(octets: [u8], from: Int) -> Int
+    if byte_at(octets, from) != '['
+        return -1
+    var i = from + 1
+    var digits = 0
+    while is_digit(byte_at(octets, i))
+        i += 1
+        digits += 1
+    if digits == 0 or byte_at(octets, i) != ']'
+        return -1
+    digits
+
+// Some content taken apart: the TAG, the process identifier if the
+// content carried one, and what is left of it.
+struct TaggedContent
+    tag: Str
+    procid: Str
+    msg: [u8]
+
+// The content of a message, taken apart.
+//
+// The TAG is the leading run of alphanumeric characters, cut at the 32
+// § 4.1.3 allows — `parse` refuses a longer one before it gets here,
+// and `parse_relaxed` takes what it can read.  A `[` digits `]` right
+// after the TAG is lifted into the process identifier, which is the one
+// convention here that § 4.1.3 does not have: nearly every sender
+// writes `su[1234]:` and a collector that left the number in the text
+// could not group one process's messages.
+//
+// Then the separator between the TAG and the content comes off — a `:`
+// if there is one, and the space after it — which is what makes a
+// message parsed and written again the octets it came in as.  `parse`
+// reads it that way on purpose; `split_tag` is § 4.1.3 and keeps it.
+fn tagged_content(content: [u8]) -> TaggedContent
+    let n = list.len(content)
+    var tag_len = tag_run(content)
+    if tag_len > max_tag_chars()
+        tag_len = max_tag_chars()
+    let tag = text_of(content, 0, tag_len)
+    var at = tag_len
+    var procid = ""
+    let digits = bracketed_number(content, at)
+    if digits > 0
+        procid = text_of(content, at + 1, at + 1 + digits)
+        at = at + digits + 2
+    if byte_at(content, at) == ':'
+        at += 1
+    if byte_at(content, at) == ' '
+        at += 1
+    let msg = list.slice(content, at, n)
+    TaggedContent { tag: tag, procid: procid, msg: msg }
+
+// A message from the parts a parser read, with no MSGID and no
+// structured data, because RFC 3164 has neither field.
+fn message_of(pri: SyslogPri, stamp: ?SyslogTimestamp, hostname: Str, app_name: Str, procid: Str,
+              msg: [u8]) -> SyslogMessage
+    // Bound before the literal: an inline `as [SyslogSdElement]` cast
+    // written as a struct-literal field is stored empty by the compiled
+    // leg; see
+    // codegen-llvm/an-identity-cast-in-a-struct-literal-field-or-tuple-element-reads-as-empty.
+    let no_sd = [] as [SyslogSdElement]
+    SyslogMessage {
+        pri: pri,
+        format: SyslogFormatRfc3164,
+        timestamp: stamp,
+        hostname: hostname,
+        app_name: app_name,
+        procid: procid,
+        msgid: "",
+        structured_data: no_sd,
+        msg: msg,
+        msg_utf8: false }
+
+// The month number a three-letter abbreviation names, or 0 when it is
+// not one of the twelve.
+fn month_number(a: Int, b: Int, c: Int) -> Int
+    let names = month_abbreviations()
+    var i = 0
+    while i < 12
+        let name = names[i]
+        if char_at(name, 0) == a and char_at(name, 1) == b and char_at(name, 2) == c
+            return i + 1
+        i += 1
+    0
+
+// The TAG rule of § 4.1.3 as a writer has to apply it: thirty-two
+// alphanumeric characters at most, and nothing else.
+fn check_tag(app_name: Str) -> ?SyslogError
+    let n = str.len(app_name)
+    if n > max_tag_chars()
+        return Some(SyslogBadTag(-1))
+    var k = 0
+    while k < n
+        if not alphanumeric(char_at(app_name, k))
+            return Some(SyslogBadTag(k))
+        k += 1
+    None
+
+// Whether a timestamp carries a part this syntax has nowhere to put.
+//
+// § 4.1.2 writes neither a year nor a zone offset, so a message that
+// carries either would go out naming a different moment than the one it
+// holds.
+fn carries_an_instant(t: SyslogTimestamp) -> Bool
+    match t.year
+        Some(_) => true
+        None    =>
+            match t.offset_minutes
+                Some(_) => true
+                None    => false
+
+// The TIMESTAMP of a message being written, and the refusal of one that
+// carries a year or an offset.
+fn format_stamp(t: ?SyslogTimestamp) -> Result<Str, SyslogError>
+    match t
+        None    => Ok("")
+        Some(x) =>
+            if carries_an_instant(x)
+                return Err(SyslogBadTimestamp(-1, "an RFC 3164 timestamp, which carries no year and no offset"))
+            format_timestamp(x)
+
+// The message after its PRI, read against § 4.1.
+fn strict_after_pri(octets: [u8], pri: SyslogPri, from: Int) -> Result<SyslogMessage, SyslogError>
+    let n = list.len(octets)
+    // § 4.1.2's timestamp is fifteen characters — `Mmm dd hh:mm:ss`,
+    // with the day space-padded below ten — so it is read by its length
+    // and never by splitting the header on spaces.
+    let stamp_end = from + 15
+    if stamp_end > n
+        return Err(SyslogBadTimestamp(from, "Mmm dd hh:mm:ss"))
+    let stamp_text = text_of(octets, from, stamp_end)
+    let parsed = parse_timestamp(stamp_text)
+    match parsed
+        Err(SyslogBadTimestamp(o, why)) =>
+            return Err(SyslogBadTimestamp(from + o, why))
+        // cov: skip — `parse_timestamp` answers `SyslogBadTimestamp` and
+        // no other fault, so this arm only keeps the match exhaustive.
+        Err(e)                          =>
+            return Err(e)
+        Ok(t)                           =>
+            var at = stamp_end
+            var hostname = ""
+            if byte_at(octets, at) == ' '
+                at += 1
+                let end = field_end(octets, at)
+                hostname = text_of(octets, at, end)
+                at = end + 1
+            let content = list.slice(octets, at, n)
+            // § 4.1.3 caps the TAG at thirty-two characters.  This is
+            // the one rule the reader applies that `split_tag` truncates
+            // instead, which is why it is checked here and not there.
+            if tag_run(content) > max_tag_chars()
+                return Err(SyslogBadTag(-1))
+            let parts = tagged_content(content)
+            let stamp = Some(t)
+            let m = message_of(pri, stamp, hostname, parts.tag, parts.procid, parts.msg)
+            Ok(m)
+
+// The message after its PRI, read the way § 4.3.3 tells a relay to read
+// one: what can be read is read, and everything else is content.
+fn relaxed_after_pri(octets: [u8], pri: SyslogPri, from: Int) -> SyslogMessage
+    let n = list.len(octets)
+    let rest = list.slice(octets, from, n)
+    let no_stamp = None as ?SyslogTimestamp
+    let stamp_end = from + 15
+    if stamp_end > n
+        return message_of(pri, no_stamp, "", "", "", rest)
+    let stamp_text = text_of(octets, from, stamp_end)
+    let parsed = parse_timestamp(stamp_text)
+    match parsed
+        Err(_) => message_of(pri, no_stamp, "", "", "", rest)
+        Ok(t)  =>
+            if byte_at(octets, stamp_end) != ' '
+                return message_of(pri, no_stamp, "", "", "", rest)
+            let at = stamp_end + 1
+            let end = field_end(octets, at)
+            if end == at
+                let remainder = list.slice(octets, at, n)
+                return message_of(pri, no_stamp, "", "", "", remainder)
+            let hostname = text_of(octets, at, end)
+            let content = list.slice(octets, end + 1, n)
+            let parts = tagged_content(content)
+            let stamp = Some(t)
+            message_of(pri, stamp, hostname, parts.tag, parts.procid, parts.msg)
+
+// The header of a message being written: the priority, then the parts
+// the message has, each after the space that separates it.
+//
+// A part the message does not have is left out with its space, so a
+// message of a priority and nothing else is a priority and nothing
+// else.  The `: ` that the content follows is written with the tag:
+// § 4.1.3's separator is part of the tag's rendering, and `parse` takes
+// it off again, which is what makes a parsed message round-trip.
+//
+// The TIMESTAMP is the one part with no space in front of it: § 4.1's
+// examples write `<34>Oct 11 22:14:15`, the priority and the timestamp
+// glued together, and `strict_after_pri` reads the timestamp from the
+// octet after `>`.  Writing a space there would put one octet into the
+// header the sender never sent, and this package's own reader would
+// refuse what this writer wrote (`bad_timestamp` at the octet the
+// space landed on).
+fn head_text(pri: SyslogPri, stamp: Str, hostname: Str, tag: Str, procid: Str) -> Str
+    let sb = str.builder_new()
+    str.builder_append(sb, syslogpri.format_pri(pri))
+    if str.len(stamp) > 0
+        str.builder_append(sb, stamp)
+    if str.len(hostname) > 0
+        str.builder_append(sb, " ")
+        str.builder_append(sb, hostname)
+    if str.len(tag) > 0
+        str.builder_append(sb, " ")
+        str.builder_append(sb, tag)
+        if str.len(procid) > 0
+            str.builder_append(sb, "[")
+            str.builder_append(sb, procid)
+            str.builder_append(sb, "]")
+        str.builder_append(sb, ": ")
+    let head = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    head
+
+// The octets of some text.
+//
+// A `Str` and a `[u8]` are two different things and this is where one
+// becomes the other.
+fn text_octets(text: Str) -> [u8]
+    let marked = bytes.from_str(text)
+    bytes.to_byte_list(marked)
+
+// A written message's octets: the header's octets, then the content's.
+fn joined(head: Str, body: [u8]) -> [u8]
+    let head_octets = text_octets(head)
+    list.concat(head_octets, body)
+
+// One RFC 3164 message written out, with the TAG and the size already
+// checked.
+fn write_message(m: SyslogMessage) -> Result<[u8], SyslogError>
+    let stamp = format_stamp(m.timestamp)
+    match stamp
+        Err(e)         =>
+            return Err(e)
+        Ok(stamp_text) =>
+            let head = head_text(m.pri, stamp_text, m.hostname, m.app_name, m.procid)
+            // § 4.1 caps the whole message at 1024 octets, and the
+            // length is known here and nowhere earlier: the content is
+            // octets, and a text length is not an octet count.
+            let total = str.len(head) + list.len(m.msg)
+            if total > max_message_octets()
+                return Err(SyslogMessageTooLong(total, max_message_octets()))
+            Ok(joined(head, m.msg))
 
 // One whole RFC 3164 message, parsed strictly.
 //
@@ -82,7 +415,12 @@ use syslogerror
 //         Err(e) => println(e.message())
 // ```
 pub fn parse(octets: [u8]) -> Result<SyslogMessage, SyslogError>
-    todo("syslog-nv.syslog3164.parse")
+    let n = list.len(octets)
+    if n > max_message_octets()
+        return Err(SyslogMessageTooLong(n, max_message_octets()))
+    let parsed = syslogpri.parse_pri(octets)
+    let (pri, at) = parsed!
+    strict_after_pri(octets, pri, at)
 
 // One RFC 3164 message, parsed the way a relay has to parse one.
 //
@@ -112,7 +450,11 @@ pub fn parse(octets: [u8]) -> Result<SyslogMessage, SyslogError>
 //     println("${list.len(m.msg)} octets of content")
 // ```
 pub fn parse_relaxed(octets: [u8], default_pri: SyslogPri) -> SyslogMessage
-    todo("syslog-nv.syslog3164.parse_relaxed")
+    let no_stamp = None as ?SyslogTimestamp
+    let parsed = syslogpri.parse_pri(octets)
+    match parsed
+        Err(_)        => message_of(default_pri, no_stamp, "", "", "", octets)
+        Ok((pri, at)) => relaxed_after_pri(octets, pri, at)
 
 // One whole RFC 3164 message, written.
 //
@@ -146,7 +488,18 @@ pub fn parse_relaxed(octets: [u8], default_pri: SyslogPri) -> SyslogMessage
 //         Err(e)     => println(e.message())
 // ```
 pub fn format(m: SyslogMessage) -> Result<[u8], SyslogError>
-    todo("syslog-nv.syslog3164.format")
+    // The read is bound before the call: a field read written straight
+    // into an argument list is what the compiled-leg defects recorded in
+    // `src/syslogmsg.nv` eat, and what they take with it is the rest of
+    // the aggregate they came from.
+    let app_name = m.app_name
+    let tag = check_tag(app_name)
+    match tag
+        Some(e) => Err(e)
+        None    =>
+            let written = write_message(m)
+            let octets = written!
+            Ok(octets)
 
 // The priority RFC 3164 § 4.3.3 tells a relay to use for a packet that
 // has none: 13, which is facility 1 and severity 5 — user-level
@@ -163,7 +516,7 @@ pub fn format(m: SyslogMessage) -> Result<[u8], SyslogError>
 //     println("${syslogpri.prival(syslog3164.default_pri())}")     // 13
 // ```
 pub fn default_pri() -> SyslogPri
-    todo("syslog-nv.syslog3164.default_pri")
+    syslogpri.pri(SyslogFacUser, SyslogSevNotice)
 
 // The TAG at the start of some content, and the content after it.
 //
@@ -191,7 +544,13 @@ pub fn default_pri() -> SyslogPri
 //     println("${list.len(rest)}")       // the colon is still there
 // ```
 pub fn split_tag(content: [u8]) -> (Str, [u8])
-    todo("syslog-nv.syslog3164.split_tag")
+    let n = list.len(content)
+    var end = tag_run(content)
+    if end > max_tag_chars()
+        end = max_tag_chars()
+    let tag = text_of(content, 0, end)
+    let rest = list.slice(content, end, n)
+    (tag, rest)
 
 // An RFC 3164 TIMESTAMP, parsed.
 //
@@ -216,7 +575,41 @@ pub fn split_tag(content: [u8]) -> (Str, [u8])
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_timestamp(text: Str) -> Result<SyslogTimestamp, SyslogError>
-    todo("syslog-nv.syslog3164.parse_timestamp")
+    if str.len(text) != 15
+        return Err(SyslogBadTimestamp(0, "Mmm dd hh:mm:ss"))
+    let month = month_number(char_at(text, 0), char_at(text, 1), char_at(text, 2))
+    if month < 1
+        return Err(SyslogBadTimestamp(0, "a month abbreviation"))
+    if char_at(text, 3) != ' '
+        return Err(SyslogBadTimestamp(3, "a space after the month"))
+    // § 4.1.2: below ten the day is written with a leading SPACE and not
+    // a leading zero, and the field is three characters wide either way.
+    // A `0` in front is refused rather than read, so that every receiver
+    // splits the header into the fields the same way.
+    var day = 0
+    let tens = char_at(text, 4)
+    if tens == ' '
+        let ones = char_at(text, 5)
+        if not is_digit(ones)
+            return Err(SyslogBadTimestamp(4, "a space-padded day of the month"))
+        day = ones - '0'
+    elif tens == '0'
+        return Err(SyslogBadTimestamp(4, "a day below ten, which § 4.1.2 pads with a space and not a zero"))
+    elif is_digit(tens)
+        let ones = char_at(text, 5)
+        if not is_digit(ones)
+            return Err(SyslogBadTimestamp(4, "a day of the month of two digits"))
+        day = (tens - '0') * 10 + (ones - '0')
+    else
+        return Err(SyslogBadTimestamp(4, "a day of the month"))
+    if char_at(text, 6) != ' '
+        return Err(SyslogBadTimestamp(6, "a space after the day"))
+    let hour = fixed_int(text, 7, 2, ':')
+    let minute = fixed_int(text, 10, 2, ':')
+    let second = fixed_int(text, 13, 2, -1)
+    if hour < 0 or minute < 0 or second < 0
+        return Err(SyslogBadTimestamp(7, "hh:mm:ss"))
+    syslogmsg.timestamp(None, month, day, hour, minute, second, 0, None)
 
 // A timestamp written the way § 4.1.2 writes one.
 //
@@ -239,7 +632,19 @@ pub fn parse_timestamp(text: Str) -> Result<SyslogTimestamp, SyslogError>
 //         Err(e) => println(e.message())
 // ```
 pub fn format_timestamp(t: SyslogTimestamp) -> Result<Str, SyslogError>
-    todo("syslog-nv.syslog3164.format_timestamp")
+    if t.month < 1 or t.month > 12
+        return Err(SyslogBadTimestamp(-1, "a month between 1 and 12"))
+    let names = month_abbreviations()
+    let name = names[t.month - 1]
+    // § 4.1.2: below ten the day is written with a space in front of it,
+    // never with a zero.
+    var day = padded(t.day, 2)
+    if t.day < 10
+        day = " " + str.from_int(t.day)
+    let hour = padded(t.hour, 2)
+    let minute = padded(t.minute, 2)
+    let second = padded(t.second, 2)
+    Ok(name + " " + day + " " + hour + ":" + minute + ":" + second)
 
 // The twelve month abbreviations § 4.1.2 allows, in calendar order:
 // `Jan`, `Feb`, `Mar`, `Apr`, `May`, `Jun`, `Jul`, `Aug`, `Sep`,
@@ -258,7 +663,7 @@ pub fn format_timestamp(t: SyslogTimestamp) -> Result<Str, SyslogError>
 //     println("${list.len(syslog3164.month_abbreviations())}")     // 12
 // ```
 pub fn month_abbreviations() -> [Str]
-    todo("syslog-nv.syslog3164.month_abbreviations")
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 // The 1024 octets § 4.1 gives a whole RFC 3164 message.
 //
@@ -273,7 +678,7 @@ pub fn month_abbreviations() -> [Str]
 //     println("${syslog3164.max_message_octets()}")     // 1024
 // ```
 pub fn max_message_octets() -> Int
-    todo("syslog-nv.syslog3164.max_message_octets")
+    1024
 
 // The 32 characters § 4.1.3 gives the TAG.
 //
@@ -286,4 +691,4 @@ pub fn max_message_octets() -> Int
 //     println(syslogerror.code(SyslogBadTag(24)))       // bad_tag
 // ```
 pub fn max_tag_chars() -> Int
-    todo("syslog-nv.syslog3164.max_tag_chars")
+    32

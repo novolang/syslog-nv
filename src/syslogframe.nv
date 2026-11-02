@@ -1,8 +1,6 @@
 // syslogframe.nv — the load-bearing interface: where one message ends,
 // decided by a reader that performs nothing.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHY FRAMING IS A SEPARATE PROBLEM
 //
 // Over UDP a syslog message needs no framing: one datagram is one
@@ -66,6 +64,291 @@
 // in `detect_framing`.
 
 use syslogerror
+
+// ── reading the octets ───────────────────────────────────────────────
+//
+// Every scanner here is byte-at-a-time and bounds-checked: the octets
+// arrived from a network, so past the end is a value (-1) and not a
+// panic.  Same shape as the scanners in the parsers beside this module,
+// and for the same reason.
+
+// Whether a byte is an ASCII digit.
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// The byte at an offset, or -1 past the end.
+fn byte_at(octets: [u8], i: Int) -> Int
+    if i < 0 or i >= list.len(octets)
+        return -1
+    octets[i] as Int
+
+// The frame size `default_limits` allows: four times the 2048 octets
+// RFC 5424 § 6.1 asks a receiver to be able to support, which leaves
+// room for the senders that ignore the recommendation.
+fn default_max_frame_octets() -> Int
+    8192
+
+// The frame size `small_limits` allows: RFC 5424 § 6.1's minimum, and
+// nothing more.
+fn small_max_frame_octets() -> Int
+    480
+
+// A count in decimal, as octets — the MSG-LEN of RFC 6587 § 3.4.1.
+fn digits_of(n: Int) -> [u8]
+    let text = str.from_int(n)
+    bytes.to_byte_list(bytes.from_str(text))
+
+// Which framing an octet begins, or `None` when it begins neither.
+//
+// RFC 6587 § 3.4.1's MSG-LEN begins with a non-zero decimal digit and a
+// syslog message begins with `<` (RFC 5424 § 6.2.1, RFC 3164 § 4.1.1),
+// so the two framings cannot begin the same way and one octet is enough
+// to tell them apart.
+//
+// It says nothing about which trailer a non-transparent stream uses.
+// RFC 6587 § 3.4.2 calls the line feed the usual one, so that is what a
+// detecting reader settles on; a receiver whose senders write something
+// else has to be told.
+fn framing_for_octet(first: Int) -> ?SyslogFraming
+    if first == '<'
+        return Some(SyslogNonTransparent(SyslogTrailerLf))
+    if first >= '1' and first <= '9'
+        return Some(SyslogOctetCounting)
+    None
+
+// The octet a detecting reader decides from: the first octet of the
+// stream, which is already in the buffer if any octet has arrived.
+fn first_octet_of(r: SyslogReader, arriving: [u8]) -> Int
+    if list.len(r.pending) > 0
+        return byte_at(r.pending, 0)
+    byte_at(arriving, 0)
+
+// The same reader, holding a framing it has settled on.
+fn settled_as(r: SyslogReader, framing: SyslogFraming) -> SyslogReader
+    SyslogReader { framing: framing, limits: r.limits, pending: r.pending, consumed: r.consumed }
+
+// The reader that answers a detection, once, from the first octet.
+//
+// A reader made with `SyslogFramingDetect` and given an octet that
+// begins neither framing stays undecided rather than guessing: the first
+// octet of a stream cannot change, so a guess made from it could never
+// be corrected and the connection would be cut at lengths invented from
+// somebody's log text.  It keeps buffering instead, and the limit is
+// what stops it — the same unbounded-holding failure as a sender that
+// never writes a trailer.
+fn settle(r: SyslogReader, arriving: [u8]) -> SyslogReader
+    match r.framing
+        SyslogFramingDetect =>
+            let head = first_octet_of(r, arriving)
+            match framing_for_octet(head)
+                Some(f) => settled_as(r, f)
+                None    => r
+        _                   => r
+
+// The reader carried forward past the octets that came out of it.
+fn reader_after(r: SyslogReader, remaining: [u8], consumed: Int) -> SyslogReader
+    SyslogReader { framing: r.framing, limits: r.limits, pending: remaining, consumed: consumed }
+
+// A reader and the fact that nothing came out of it.
+fn no_frame(r: SyslogReader) -> SyslogFed
+    SyslogFed { reader: r, frame: None }
+
+// A reader and the one frame that came out of it.
+//
+// One place builds a `SyslogFrame`, so `at` and the octets are written
+// in one order everywhere and there is one site to read when a frame
+// is reported at the wrong offset.
+fn with_frame(r: SyslogReader, octets: [u8], at: Int) -> SyslogFed
+    let one = SyslogFrame { octets: octets, at: at }
+    let maybe = Some(one)
+    SyslogFed { reader: r, frame: maybe }
+
+// The offset of the first octet equal to `b` at or after `from`, or -1.
+fn find_byte_from(octets: [u8], b: Int, from: Int) -> Int
+    let n = list.len(octets)
+    var i = from
+    while i < n
+        if byte_at(octets, i) == b
+            return i
+        i += 1
+    -1
+
+// The offset of the first `%d13 %d10` at or after `from`, or -1.
+//
+// A carriage return with no line feed after it yet is a prefix and not a
+// trailer: the line feed it is waiting for may be the next octet to
+// arrive, which on a socket is the ordinary case and not a fault.
+fn find_crlf_from(octets: [u8], from: Int) -> Int
+    let n = list.len(octets)
+    var i = from
+    while i + 1 < n
+        if byte_at(octets, i) == 13 and byte_at(octets, i + 1) == 10
+            return i
+        i += 1
+    -1
+
+// Where a message framed this way ends, or -1 when no trailer has
+// arrived yet.
+fn trailer_at(octets: [u8], from: Int, trailer: SyslogTrailer) -> Int
+    match trailer
+        SyslogTrailerLf   => find_byte_from(octets, 10, from)
+        SyslogTrailerNul  => find_byte_from(octets, 0, from)
+        SyslogTrailerCrLf => find_crlf_from(octets, from)
+
+// What the octets at the head of an octet-counted stream say about the
+// frame that follows.
+struct LengthPrefix
+    // Whether the whole prefix is there: the digits AND the space after
+    // them.  A prefix that is still arriving is not a fault.
+    complete: Bool
+    // The number it names.  Meaningless while `complete` is false, and a
+    // LOWER BOUND once the number has passed ten to the seventeenth — a
+    // length that long is over any limit a reader can be given, and
+    // carrying it exactly would overflow before it could be refused.
+    declared: Int
+    // The octets the prefix occupies: the digits and the space, so the
+    // message starts at this offset.  Zero while `complete` is false.
+    width: Int
+
+// The MSG-LEN at the head of the buffer, parsed as far as it goes.
+//
+// RFC 6587 § 3.4.1 writes it as a non-zero digit, more digits, and one
+// space.  Anything else is `SyslogBadFrameLength`, and it is a FRAMING
+// fault because there is nothing in an octet-counted stream to
+// resynchronise on: the length that would have said where the next
+// message starts is the thing that is unreadable.
+fn length_prefix(octets: [u8]) -> Result<LengthPrefix, SyslogError>
+    var i = 0
+    var value = 0
+    var digits = 0
+    while is_digit(byte_at(octets, i))
+        if value < 100000000000000000
+            value = value * 10 + (byte_at(octets, i) - '0')
+        i += 1
+        digits += 1
+    if digits == 0
+        if byte_at(octets, i) < 0
+            return Ok(LengthPrefix { complete: false, declared: 0, width: 0 })
+        return Err(SyslogBadFrameLength(i))
+    if byte_at(octets, 0) == '0'
+        return Err(SyslogBadFrameLength(0))
+    if byte_at(octets, i) == ' '
+        return Ok(LengthPrefix { complete: true, declared: value, width: i + 1 })
+    if byte_at(octets, i) < 0
+        return Ok(LengthPrefix { complete: false, declared: value, width: 0 })
+    Err(SyslogBadFrameLength(i))
+
+// The same fault, positioned in the stream rather than in the buffer.
+//
+// `length_prefix` reads the octets the reader is holding and counts
+// from the first of them; a fault a person reads is counted from the
+// first octet the reader was EVER given, because a chunk boundary is an
+// artefact of how the host read its socket and must not appear in it.
+fn at_stream_offset(e: SyslogError, by: Int) -> SyslogError
+    match e
+        SyslogBadFrameLength(at) => SyslogBadFrameLength(at + by)
+        // cov: skip — `length_prefix` answers `SyslogBadFrameLength` and
+        // no other fault, so this arm only keeps the match exhaustive.
+        _                        => e
+
+// One frame out of an octet-counted buffer, or none.
+fn take_counted(r: SyslogReader) -> Result<SyslogFed, SyslogError>
+    let prefix = length_prefix(r.pending)
+    match prefix
+        Err(e) =>
+            return Err(at_stream_offset(e, r.consumed))
+        Ok(p)  =>
+            let held = list.len(r.pending)
+            let limit = r.limits.max_frame_octets
+            if not p.complete
+                // A length still being written holds only its own
+                // digits, so a buffer this size is a sender that is not
+                // a sender of this framing at all.
+                if held > limit
+                    return Err(SyslogFrameTooLarge(held, limit))
+                return Ok(no_frame(r))
+            // The declared length is the whole cost of the frame, and
+            // it is known before one octet of the message arrives: a
+            // ten-digit length is ten octets to send.
+            if p.declared > limit
+                return Err(SyslogFrameTooLarge(p.declared, limit))
+            let total = p.width + p.declared
+            if held < total
+                return Ok(no_frame(r))
+            let message = list.slice(r.pending, p.width, total)
+            let remaining = list.slice(r.pending, total, held)
+            let advanced = reader_after(r, remaining, r.consumed + total)
+            Ok(with_frame(advanced, message, r.consumed + p.width))
+
+// One frame out of a non-transparently framed buffer, or none.
+fn take_delimited(r: SyslogReader, trailer: SyslogTrailer) -> Result<SyslogFed, SyslogError>
+    let at = trailer_at(r.pending, 0, trailer)
+    let held = list.len(r.pending)
+    if at < 0
+        // The limit is what bounds this framing: § 3.4.2 has no length
+        // to check, so a sender that never writes the trailer would
+        // otherwise make the reader hold the connection forever.
+        if held > r.limits.max_frame_octets
+            return Err(SyslogFrameTooLarge(held, r.limits.max_frame_octets))
+        return Ok(no_frame(r))
+    let width = list.len(trailer_octets(trailer))
+    let message = list.slice(r.pending, 0, at)
+    let remaining = list.slice(r.pending, at + width, held)
+    let advanced = reader_after(r, remaining, r.consumed + at + width)
+    Ok(with_frame(advanced, message, r.consumed))
+
+// Every frame the buffer already holds.
+//
+// The pump `feed` and `take` write once, here, rather than at each call
+// site: `frame: None` is the signal to stop, and it is not a fault.
+fn take_all(r: SyslogReader) -> Result<SyslogDrained, SyslogError>
+    var frames: [SyslogFrame] = []
+    var current = r
+    var more = true
+    while more
+        match take(current)
+            Err(e)  =>
+                return Err(e)
+            Ok(fed) =>
+                current = fed.reader
+                match fed.frame
+                    Some(f) => list.push(frames, f)
+                    None    =>
+                        more = false
+    Ok(SyslogDrained { reader: current, frames: frames })
+
+// What the octets still in the buffer are worth when the peer closes.
+//
+// A close with nothing pending is an ordinary end under both framings.
+// For the rest they disagree, and both answers matter: under
+// non-transparent framing those octets ARE a message, because § 3.4.2
+// does not require a trailer on the last one, and the last line of a
+// connection is the one that says why the sender is going away; under
+// octet counting the same octets are a prefix, because the length said
+// how much was coming and it did not come.
+fn close_last(r: SyslogReader) -> Result<SyslogFed, SyslogError>
+    let held = list.len(r.pending)
+    if held == 0
+        return Ok(no_frame(r))
+    match r.framing
+        SyslogOctetCounting     =>
+            return Err(SyslogFrameTruncated(r.consumed + held))
+        SyslogNonTransparent(_) =>
+            let message = r.pending
+            // Bound before the reader is built: an inline `as [u8]` cast
+            // written as a struct-literal field is stored empty by the
+            // compiled leg; see
+            // codegen-llvm/an-identity-cast-in-a-struct-literal-field-or-tuple-element-reads-as-empty.
+            let no_octets = [] as [u8]
+            let advanced = reader_after(r, no_octets, r.consumed + held)
+            return Ok(with_frame(advanced, message, r.consumed))
+        SyslogFramingDetect     =>
+            // Nothing settled the framing, so nothing can say where the
+            // buffered octets end.  Calling them a message would be
+            // inventing a boundary the stream never stated, and the
+            // octets begin with neither `<` nor a digit, so they are not
+            // a stream either framing can read.
+            return Err(SyslogBadFrameLength(0))
 
 // The octet that ends a message under non-transparent framing.
 //
@@ -234,7 +517,7 @@ pub struct SyslogReader
 //     println("${syslogframe.default_limits().max_frame_octets}")   // 8192
 // ```
 pub fn default_limits() -> SyslogLimits
-    todo("syslog-nv.syslogframe.default_limits")
+    SyslogLimits { max_frame_octets: default_max_frame_octets() }
 
 // A frame of at most 480 octets.
 //
@@ -251,7 +534,7 @@ pub fn default_limits() -> SyslogLimits
 //     println("${syslogframe.small_limits().max_frame_octets}")     // 480
 // ```
 pub fn small_limits() -> SyslogLimits
-    todo("syslog-nv.syslogframe.small_limits")
+    SyslogLimits { max_frame_octets: small_max_frame_octets() }
 
 // A reader holding nothing, for one framing and one set of limits.
 //
@@ -264,7 +547,12 @@ pub fn small_limits() -> SyslogLimits
 //     println("${syslogframe.pending_len(r)}")    // 0
 // ```
 pub fn reader(framing: SyslogFraming, limits: SyslogLimits) -> SyslogReader
-    todo("syslog-nv.syslogframe.reader")
+    // Bound before the literal: an inline `as [u8]` cast written as a
+    // struct-literal field is stored empty by the compiled leg, so every
+    // reader ever made would hold somebody else's octets; see
+    // codegen-llvm/an-identity-cast-in-a-struct-literal-field-or-tuple-element-reads-as-empty.
+    let no_octets = [] as [u8]
+    SyslogReader { framing: framing, limits: limits, pending: no_octets, consumed: 0 }
 
 // Adds octets and takes one frame, if the addition completed one.
 //
@@ -286,7 +574,13 @@ pub fn reader(framing: SyslogFraming, limits: SyslogLimits) -> SyslogReader
 //         Err(e)  => println(e.message())
 // ```
 pub fn feed(r: SyslogReader, octets: [u8]) -> Result<SyslogFed, SyslogError>
-    todo("syslog-nv.syslogframe.feed")
+    // The framing settles from the first octet of the stream, which is
+    // in the buffer only if the caller fed nothing before this.
+    let settled = settle(r, octets)
+    let held = settled.pending
+    let grown_octets = list.concat(held, octets)
+    let grown = reader_after(settled, grown_octets, settled.consumed)
+    take(grown)
 
 // Takes one frame if a complete one is already buffered, adding
 // nothing.
@@ -308,7 +602,17 @@ pub fn feed(r: SyslogReader, octets: [u8]) -> Result<SyslogFed, SyslogError>
 //         Err(e)  => println(e.message())
 // ```
 pub fn take(r: SyslogReader) -> Result<SyslogFed, SyslogError>
-    todo("syslog-nv.syslogframe.take")
+    match r.framing
+        SyslogOctetCounting     =>
+            return take_counted(r)
+        SyslogNonTransparent(t) =>
+            return take_delimited(r, t)
+        SyslogFramingDetect     =>
+            // No octet that settles the framing has arrived, so there is
+            // no way to cut anything out.  "Not yet" is `frame: None`
+            // here as everywhere else: what is in the buffer is a
+            // prefix of a stream, not a fault.
+            return Ok(no_frame(r))
 
 // Adds octets and takes every frame they completed.
 //
@@ -328,7 +632,26 @@ pub fn take(r: SyslogReader) -> Result<SyslogFed, SyslogError>
 //         Err(e) => println(e.message())
 // ```
 pub fn drain(r: SyslogReader, octets: [u8]) -> Result<SyslogDrained, SyslogError>
-    todo("syslog-nv.syslogframe.drain")
+    match feed(r, octets)
+        Err(e)  =>
+            return Err(e)
+        Ok(fed) =>
+            match take_all(fed.reader)
+                Err(e)   =>
+                    return Err(e)
+                Ok(rest) =>
+                    match fed.frame
+                        Some(f) =>
+                            // The frame `feed` took came before every
+                            // frame `take_all` took, and the two lists
+                            // are one answer in that order.
+                            let first = [f]
+                            let rest_frames = rest.frames
+                            let all = list.concat(first, rest_frames)
+                            let out_reader = rest.reader
+                            return Ok(SyslogDrained { reader: out_reader, frames: all })
+                        None    =>
+                            return Ok(rest)
 
 // Tells the reader the peer closed, and takes the last frame.
 //
@@ -361,7 +684,17 @@ pub fn drain(r: SyslogReader, octets: [u8]) -> Result<SyslogDrained, SyslogError
 //         Err(e)  => println(e.message())
 // ```
 pub fn finish(r: SyslogReader) -> Result<SyslogFed, SyslogError>
-    todo("syslog-nv.syslogframe.finish")
+    match take(r)
+        Err(e)  =>
+            return Err(e)
+        Ok(fed) =>
+            match fed.frame
+                // A frame that was already complete when the peer closed
+                // is the last frame, and the close adds nothing to it.
+                Some(_) =>
+                    return Ok(fed)
+                None    =>
+                    return close_last(fed.reader)
 
 // How many octets the reader is holding.
 //
@@ -378,7 +711,7 @@ pub fn finish(r: SyslogReader) -> Result<SyslogFed, SyslogError>
 //     println("${syslogframe.pending_len(r)}")     // 0
 // ```
 pub fn pending_len(r: SyslogReader) -> Int
-    todo("syslog-nv.syslogframe.pending_len")
+    list.len(r.pending)
 
 // How many octets this reader has consumed since it was made.
 //
@@ -394,7 +727,7 @@ pub fn pending_len(r: SyslogReader) -> Int
 //     println("${syslogframe.offset(r)}")          // 0
 // ```
 pub fn offset(r: SyslogReader) -> Int
-    todo("syslog-nv.syslogframe.offset")
+    r.consumed
 
 // The framing this reader is using.
 //
@@ -414,7 +747,7 @@ pub fn offset(r: SyslogReader) -> Int
 //         _                   => println("settled")
 // ```
 pub fn framing_of(r: SyslogReader) -> SyslogFraming
-    todo("syslog-nv.syslogframe.framing_of")
+    r.framing
 
 // Which framing some octets are in, or `None`.
 //
@@ -440,7 +773,7 @@ pub fn framing_of(r: SyslogReader) -> SyslogFraming
 //         None                      => println("neither")
 // ```
 pub fn detect_framing(octets: [u8]) -> ?SyslogFraming
-    todo("syslog-nv.syslogframe.detect_framing")
+    framing_for_octet(byte_at(octets, 0))
 
 // The octets a trailer is: one for a line feed or a NUL, two for a
 // carriage return and line feed.
@@ -453,7 +786,10 @@ pub fn detect_framing(octets: [u8]) -> ?SyslogFraming
 //     println("${list.len(syslogframe.trailer_octets(SyslogTrailerCrLf))}")    // 2
 // ```
 pub fn trailer_octets(t: SyslogTrailer) -> [u8]
-    todo("syslog-nv.syslogframe.trailer_octets")
+    match t
+        SyslogTrailerLf   => [10 as u8]
+        SyslogTrailerCrLf => [13 as u8, 10 as u8]
+        SyslogTrailerNul  => [0 as u8]
 
 // One message's octets, framed for sending.
 //
@@ -484,4 +820,30 @@ pub fn trailer_octets(t: SyslogTrailer) -> [u8]
 //         Err(e) => println(syslogerror.code(e))     // trailer_in_message
 // ```
 pub fn frame(message: [u8], framing: SyslogFraming) -> Result<[u8], SyslogError>
-    todo("syslog-nv.syslogframe.frame")
+    match framing
+        SyslogOctetCounting           =>
+            let n = list.len(message)
+            // § 3.4.1's MSG-LEN begins with a non-zero digit, so a
+            // zero-octet message has no spelling in this framing: `0 `
+            // is a frame every reader of this package refuses, and
+            // writing one would be the same failure as writing a
+            // trailer inside a message.
+            if n == 0
+                return Err(SyslogBadFrameLength(0))
+            let digits = digits_of(n)
+            let with_space = list.concat(digits, [32 as u8])
+            let out = list.concat(with_space, message)
+            return Ok(out)
+        SyslogNonTransparent(trailer) =>
+            let at = trailer_at(message, 0, trailer)
+            if at >= 0
+                return Err(SyslogTrailerInMessage(at))
+            let trailer_bits = trailer_octets(trailer)
+            let out = list.concat(message, trailer_bits)
+            return Ok(out)
+        // Detection is a question about a stream that is arriving, and
+        // `SyslogBadFrameLength` is the fault that says the framing the
+        // caller named cannot frame anything at all.  There is no
+        // variant for "not a framing to write with" — see the
+        // CHANGELOG's `### Known`.
+        SyslogFramingDetect           => Err(SyslogBadFrameLength(0))

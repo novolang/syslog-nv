@@ -1,0 +1,158 @@
+// syslogsd_cover_tests.nv — every way a structured-data field can be
+// malformed, and every way a lookup can come up empty.
+//
+// Added while landing the package.  The API suite asserts the spelling
+// § 6.3.3 gives a well-formed field; a reader is judged by what it does
+// with the octets a sender got wrong, so each refusal below is provoked
+// on its own and asked where it says the fault was.
+
+use std.test
+use syslogsd
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+fn bad_at(octets: [u8]) -> Int
+    // The octet a refusal names, or -1 when the call did not refuse at
+    // all — which fails the case that asked, because every buffer
+    // passed here is one the grammar does not allow.
+    match syslogsd.parse(octets)
+        Ok(_)                               => -1
+        Err(SyslogBadStructuredData(at, _)) => at
+        Err(_)                              => -2
+
+@test
+fn test_a_lookup_that_finds_nothing_answers_none() [io]
+    test.case("an element of a field that does not have it")
+    let sd = [syslogsd.element("meta", [syslogsd.param("language", "en")])]
+    match syslogsd.element_of(sd, "origin")
+        Some(_) => test.fail("that field has no origin element")
+        None    => test.assert(true)
+
+    test.case("and one of nothing at all")
+    match syslogsd.element_of([] as [SyslogSdElement], "meta")
+        Some(_) => test.fail("there are no elements to find")
+        None    => test.assert(true)
+
+@test
+fn test_an_enterprise_number_is_digits_or_it_is_not_an_enterprise_number() [io]
+    // RFC 5424 § 6.3.2's private form is `name@<number>`.  What follows
+    // the `@` has to be a number for the question to have an answer;
+    // `myThing@example.com` has none, and a trailing `@` is not zero.
+    test.case("the RFC's own private SD-ID")
+    match syslogsd.enterprise_number("exampleSDID@32473")
+        None    => test.fail("32473 is a private enterprise number")
+        Some(n) => test.assert(n == 32473)
+
+    test.case("an `@` with nothing after it")
+    match syslogsd.enterprise_number("myThing@")
+        Some(n) => test.fail("there is no number there")
+        None    => test.assert(true)
+
+    test.case("and an `@` followed by something that is not a number")
+    match syslogsd.enterprise_number("myThing@example.com")
+        Some(n) => test.fail("a domain name is not an enterprise number")
+        None    => test.assert(true)
+
+    test.case("while a name with no `@` at all is not a private one")
+    match syslogsd.enterprise_number("myThing")
+        Some(n) => test.fail("a bare SD-ID is reserved by IANA")
+        None    => test.assert(true)
+
+@test
+fn test_a_naughty_name_is_refused_wherever_it_sits_in_the_field() [io]
+    // `check` runs over both halves of the grammar: the SD-ID of every
+    // element and the PARAM-NAME of every parameter.  A name that got
+    // past the builder is a name a sender could put on the wire, so
+    // both refusals are asserted with the name they carry.
+    test.case("an SD-ID that is not an SD-NAME")
+    match syslogsd.check([syslogsd.element("has space", [] as [SyslogSdParam])])
+        None    => test.fail("a space is not allowed in an SD-NAME")
+        Some(e) =>
+            test.assert(syslogerror.code(e) == "sd_name_invalid")
+            test.assert(str.contains(e.message(), "has space"))
+
+    test.case("and a PARAM-NAME that is not, inside an element that is")
+    match syslogsd.check([syslogsd.element("meta", [syslogsd.param("a b", "x")])])
+        None    => test.fail("a space is not allowed in a PARAM-NAME")
+        Some(e) =>
+            test.assert(syslogerror.code(e) == "sd_name_invalid")
+            test.assert(str.contains(e.message(), "a b"))
+
+    test.case("which is the same fault `format` refuses rather than writing")
+    match syslogsd.format([syslogsd.element("has space", [] as [SyslogSdParam])])
+        Ok(_)  => test.fail("a field this package cannot read back is not written")
+        Err(e) => test.assert(syslogerror.code(e) == "sd_name_invalid")
+
+    test.case("while a well-formed field of the same shape goes through")
+    match syslogsd.format([syslogsd.element("meta", [syslogsd.param("language", "en")])])
+        Err(_) => test.fail("that is the RFC's own example")
+        Ok(s)  => test.assert(s == "[meta language=\"en\"]")
+
+@test
+fn test_the_structured_data_reader_refuses_each_malformed_octet() [io]
+    // Every branch of `syslogsd.parse`'s grammar, taken one octet at a
+    // time, each asserted at the position a person reading a log would
+    // be sent to.  Each buffer is named so that the case reads as the
+    // fault it is about.
+    test.case("octets that are neither `-` nor `[`")
+    let not_a_field = octets_of("abc")
+    test.assert(bad_at(not_a_field) == 0)
+
+    test.case("a `[` with no SD-ID in it")
+    let just_open = octets_of("[")
+    test.assert(bad_at(just_open) == 1)
+
+    test.case("an SD-ID that is never closed")
+    let bare = octets_of("[abc")
+    test.assert(bad_at(bare) == 4)
+
+    test.case("a `]` where a PARAM-NAME should be")
+    let no_name = octets_of("[meta ]")
+    test.assert(bad_at(no_name) == 6)
+
+    test.case("a PARAM-NAME with no `=` after it")
+    let no_equals = octets_of("[meta lang]")
+    test.assert(bad_at(no_equals) == 10)
+
+    test.case("an `=` whose value is not quoted")
+    let no_quote = octets_of("[meta lang=x]")
+    test.assert(bad_at(no_quote) == 11)
+
+    test.case("a PARAM-VALUE that is never closed by a quote")
+    let open_value = octets_of("[meta lang=\"abc")
+    test.assert(bad_at(open_value) == list.len(open_value))
+
+    test.case("and one whose last octet is a backslash, so the scan runs past the end")
+    let open_escape = octets_of("[meta lang=\"a\\")
+    test.assert(bad_at(open_escape) == list.len(open_escape))
+
+    test.case("octets after the closing quote that are neither a space nor a `]`")
+    let after_quote = octets_of("[meta lang=\"a\"x")
+    test.assert(bad_at(after_quote) == 14)
+
+@test
+fn test_a_parameter_value_is_read_with_rfc_5424s_own_escape_rule() [io]
+    // § 6.3.3: a backslash swallows the octet after it, whatever that
+    // octet is — which is why the closing quote is found by the scan
+    // and not by the first `"` in the buffer.  A value holding an
+    // escaped quote and a value holding a Windows path are the two
+    // cases that tell a correct reader from a wrong one.
+    test.case("`\\\"` is a quote inside the value, not the end of it")
+    match syslogsd.parse(octets_of("[meta lang=\"a\\\"b\"]"))
+        Err(_)      => test.fail("that field is well formed")
+        Ok((sd, _)) =>
+            let e = list.get(sd, 0)
+            match syslogsd.value_of(e, "lang")
+                None    => test.fail("the parameter is `lang`")
+                Some(v) => test.assert(v == "a\"b")
+
+    test.case("and a backslash before an ordinary octet is kept, not eaten")
+    match syslogsd.parse(octets_of("[meta path=\"C:\\temp\"]"))
+        Err(_)      => test.fail("that field is well formed")
+        Ok((sd, _)) =>
+            let e = list.get(sd, 0)
+            match syslogsd.value_of(e, "path")
+                None    => test.fail("the parameter is `path`")
+                Some(v) => test.assert(v == "C:\\temp")

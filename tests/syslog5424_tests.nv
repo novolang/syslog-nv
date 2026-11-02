@@ -1,9 +1,8 @@
 // syslog5424_tests.nv — the API suite for the modern format.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// syslog-nv.syslog5424.<fn>`.  The fixtures are the four example
-// messages of RFC 5424 § 6.5 and the timestamp examples of § 6.2.3.1,
-// so what is asserted is the RFC and not this package's opinion of it.
+// The fixtures are the four example messages of RFC 5424 § 6.5 and the
+// timestamp examples of § 6.2.3.1, so what is asserted is the RFC and
+// not this package's opinion of it.
 
 use std.test
 use syslog5424

@@ -1,7 +1,5 @@
 // syslogpri.nv — the priority, taken apart into the two things it is.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHAT A PRIORITY IS
 //
 // Both syslog formats begin with a priority: a `<`, a decimal number,
@@ -52,6 +50,28 @@
 // distinct and normative — so `severity_from_name` exists.
 
 use syslogerror
+
+// Whether a byte is an ASCII digit.
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// The byte at an offset, or -1 past the end.
+//
+// A reader in this package walks octets that arrived from a network,
+// so every one of them is bounds-checked and past the end is a value
+// rather than a panic.
+fn byte_at(octets: [u8], i: Int) -> Int
+    if i < 0 or i >= list.len(octets)
+        return -1
+    octets[i] as Int
+
+// The biggest facility number, which is `local use 7` (RFC 5424
+// § 6.2.1, Table 1).
+const MAX_FACILITY = 23
+
+// The biggest severity number, which is `Debug` (RFC 5424 § 6.2.1,
+// Table 2).
+const MAX_SEVERITY = 7
 
 // Which part of a system a message came from.
 //
@@ -182,7 +202,7 @@ pub struct SyslogPri
 //     println("${syslogpri.prival(p)}")     // 18
 // ```
 pub fn pri(facility: SyslogFacility, severity: SyslogSeverity) -> SyslogPri
-    todo("syslog-nv.syslogpri.pri")
+    SyslogPri { facility: facility, severity: severity }
 
 // The priority value a priority encodes to: facility times eight plus
 // severity (RFC 5424 § 6.2.1).
@@ -197,7 +217,7 @@ pub fn pri(facility: SyslogFacility, severity: SyslogSeverity) -> SyslogPri
 //     println("${syslogpri.prival(syslogpri.pri(SyslogFacKern, SyslogSevEmergency))}")   // 0
 // ```
 pub fn prival(p: SyslogPri) -> Int
-    todo("syslog-nv.syslogpri.prival")
+    facility_number(p.facility) * 8 + severity_number(p.severity)
 
 // The priority a priority value encodes, or a refusal.
 //
@@ -216,7 +236,18 @@ pub fn prival(p: SyslogPri) -> Int
 //         Err(e) => println(syslogerror.code(e))
 // ```
 pub fn from_prival(prival: Int) -> Result<SyslogPri, SyslogError>
-    todo("syslog-nv.syslogpri.from_prival")
+    if prival < 0 or prival > MAX_FACILITY * 8 + MAX_SEVERITY
+        return Err(SyslogPriValueTooLarge(prival))
+    match facility_from_number(prival / 8)
+        Err(e) =>
+            // cov: skip — the bound above caps prival at 191, so its quotient is at most 23 and facility_from_number has nothing to refuse
+            Err(e)
+        Ok(f)  =>
+            match severity_from_number(prival % 8)
+                Err(e) =>
+                    // cov: skip — the bound above caps the remainder at 7, so severity_from_number has nothing to refuse
+                    Err(e)
+                Ok(s)  => Ok(SyslogPri { facility: f, severity: s })
 
 // The number a facility has in RFC 5424 § 6.2.1, Table 1: 0 to 23.
 //
@@ -227,7 +258,31 @@ pub fn from_prival(prival: Int) -> Result<SyslogPri, SyslogError>
 //     println("${syslogpri.facility_number(SyslogFacDaemon)}")   // 3
 // ```
 pub fn facility_number(f: SyslogFacility) -> Int
-    todo("syslog-nv.syslogpri.facility_number")
+    match f
+        SyslogFacKern     => 0
+        SyslogFacUser     => 1
+        SyslogFacMail     => 2
+        SyslogFacDaemon   => 3
+        SyslogFacAuth     => 4
+        SyslogFacSyslog   => 5
+        SyslogFacLpr      => 6
+        SyslogFacNews     => 7
+        SyslogFacUucp     => 8
+        SyslogFacCron     => 9
+        SyslogFacAuthPriv => 10
+        SyslogFacFtp      => 11
+        SyslogFacNtp      => 12
+        SyslogFacAudit    => 13
+        SyslogFacAlert    => 14
+        SyslogFacCron2    => 15
+        SyslogFacLocal0   => 16
+        SyslogFacLocal1   => 17
+        SyslogFacLocal2   => 18
+        SyslogFacLocal3   => 19
+        SyslogFacLocal4   => 20
+        SyslogFacLocal5   => 21
+        SyslogFacLocal6   => 22
+        SyslogFacLocal7   => 23
 
 // The number a severity has in RFC 5424 § 6.2.1, Table 2: 0 to 7.
 //
@@ -238,7 +293,15 @@ pub fn facility_number(f: SyslogFacility) -> Int
 //     println("${syslogpri.severity_number(SyslogSevWarning)}")   // 4
 // ```
 pub fn severity_number(s: SyslogSeverity) -> Int
-    todo("syslog-nv.syslogpri.severity_number")
+    match s
+        SyslogSevEmergency     => 0
+        SyslogSevAlert         => 1
+        SyslogSevCritical      => 2
+        SyslogSevError         => 3
+        SyslogSevWarning       => 4
+        SyslogSevNotice        => 5
+        SyslogSevInformational => 6
+        SyslogSevDebug         => 7
 
 // The facility a number denotes, or a refusal above 23.
 //
@@ -251,7 +314,34 @@ pub fn severity_number(s: SyslogSeverity) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn facility_from_number(n: Int) -> Result<SyslogFacility, SyslogError>
-    todo("syslog-nv.syslogpri.facility_from_number")
+    match n
+        0  => Ok(SyslogFacKern)
+        1  => Ok(SyslogFacUser)
+        2  => Ok(SyslogFacMail)
+        3  => Ok(SyslogFacDaemon)
+        4  => Ok(SyslogFacAuth)
+        5  => Ok(SyslogFacSyslog)
+        6  => Ok(SyslogFacLpr)
+        7  => Ok(SyslogFacNews)
+        8  => Ok(SyslogFacUucp)
+        9  => Ok(SyslogFacCron)
+        10 => Ok(SyslogFacAuthPriv)
+        11 => Ok(SyslogFacFtp)
+        12 => Ok(SyslogFacNtp)
+        13 => Ok(SyslogFacAudit)
+        14 => Ok(SyslogFacAlert)
+        15 => Ok(SyslogFacCron2)
+        16 => Ok(SyslogFacLocal0)
+        17 => Ok(SyslogFacLocal1)
+        18 => Ok(SyslogFacLocal2)
+        19 => Ok(SyslogFacLocal3)
+        20 => Ok(SyslogFacLocal4)
+        21 => Ok(SyslogFacLocal5)
+        22 => Ok(SyslogFacLocal6)
+        23 => Ok(SyslogFacLocal7)
+        // Everything else, a negative number included, names no
+        // facility in Table 1.
+        _  => Err(SyslogPriValueTooLarge(n))
 
 // The severity a number denotes, or a refusal above 7.
 //
@@ -264,7 +354,16 @@ pub fn facility_from_number(n: Int) -> Result<SyslogFacility, SyslogError>
 //         Err(e) => println(e.message())
 // ```
 pub fn severity_from_number(n: Int) -> Result<SyslogSeverity, SyslogError>
-    todo("syslog-nv.syslogpri.severity_from_number")
+    match n
+        0 => Ok(SyslogSevEmergency)
+        1 => Ok(SyslogSevAlert)
+        2 => Ok(SyslogSevCritical)
+        3 => Ok(SyslogSevError)
+        4 => Ok(SyslogSevWarning)
+        5 => Ok(SyslogSevNotice)
+        6 => Ok(SyslogSevInformational)
+        7 => Ok(SyslogSevDebug)
+        _ => Err(SyslogPriValueTooLarge(n))
 
 // What RFC 5424 § 6.2.1, Table 1 calls this facility.
 //
@@ -280,7 +379,34 @@ pub fn severity_from_number(n: Int) -> Result<SyslogSeverity, SyslogError>
 //     println(syslogpri.facility_description(SyslogFacKern))    // kernel messages
 // ```
 pub fn facility_description(f: SyslogFacility) -> Str
-    todo("syslog-nv.syslogpri.facility_description")
+    match f
+        SyslogFacKern     => "kernel messages"
+        SyslogFacUser     => "user-level messages"
+        SyslogFacMail     => "mail system"
+        SyslogFacDaemon   => "system daemons"
+        // Table 1 gives 4 and 10 the same description, which is why
+        // this is not a lookup key.
+        SyslogFacAuth     => "security/authorization messages"
+        SyslogFacSyslog   => "messages generated internally by syslogd"
+        SyslogFacLpr      => "line printer subsystem"
+        SyslogFacNews     => "network news subsystem"
+        SyslogFacUucp     => "UUCP subsystem"
+        // And 9 and 15 the same one.
+        SyslogFacCron     => "clock daemon"
+        SyslogFacAuthPriv => "security/authorization messages"
+        SyslogFacFtp      => "FTP daemon"
+        SyslogFacNtp      => "NTP subsystem"
+        SyslogFacAudit    => "log audit"
+        SyslogFacAlert    => "log alert"
+        SyslogFacCron2    => "clock daemon"
+        SyslogFacLocal0   => "local use 0"
+        SyslogFacLocal1   => "local use 1"
+        SyslogFacLocal2   => "local use 2"
+        SyslogFacLocal3   => "local use 3"
+        SyslogFacLocal4   => "local use 4"
+        SyslogFacLocal5   => "local use 5"
+        SyslogFacLocal6   => "local use 6"
+        SyslogFacLocal7   => "local use 7"
 
 // What RFC 5424 § 6.2.1, Table 2 calls this severity.
 //
@@ -296,7 +422,15 @@ pub fn facility_description(f: SyslogFacility) -> Str
 //     println(syslogpri.severity_name(SyslogSevNotice))         // Notice
 // ```
 pub fn severity_name(s: SyslogSeverity) -> Str
-    todo("syslog-nv.syslogpri.severity_name")
+    match s
+        SyslogSevEmergency     => "Emergency"
+        SyslogSevAlert         => "Alert"
+        SyslogSevCritical      => "Critical"
+        SyslogSevError         => "Error"
+        SyslogSevWarning       => "Warning"
+        SyslogSevNotice        => "Notice"
+        SyslogSevInformational => "Informational"
+        SyslogSevDebug         => "Debug"
 
 // The severity a name denotes, ignoring case, or `None`.
 //
@@ -315,7 +449,16 @@ pub fn severity_name(s: SyslogSeverity) -> Str
 //         None    => println("not a severity name")
 // ```
 pub fn severity_from_name(name: Str) -> ?SyslogSeverity
-    todo("syslog-nv.syslogpri.severity_from_name")
+    match str.lower(name)
+        "emergency"     => Some(SyslogSevEmergency)
+        "alert"         => Some(SyslogSevAlert)
+        "critical"      => Some(SyslogSevCritical)
+        "error"         => Some(SyslogSevError)
+        "warning"       => Some(SyslogSevWarning)
+        "notice"        => Some(SyslogSevNotice)
+        "informational" => Some(SyslogSevInformational)
+        "debug"         => Some(SyslogSevDebug)
+        _               => None
 
 // Whether `a` is at least as severe as `b`.
 //
@@ -336,7 +479,7 @@ pub fn severity_from_name(name: Str) -> ?SyslogSeverity
 //     println("${syslogpri.is_at_least_as_severe(SyslogSevDebug, SyslogSevWarning)}")   // false
 // ```
 pub fn is_at_least_as_severe(a: SyslogSeverity, b: SyslogSeverity) -> Bool
-    todo("syslog-nv.syslogpri.is_at_least_as_severe")
+    severity_number(a) <= severity_number(b)
 
 // The priority at the start of some octets, and how many octets it
 // took.
@@ -361,7 +504,29 @@ pub fn is_at_least_as_severe(a: SyslogSeverity, b: SyslogSeverity) -> Bool
 //         Err(e)     => println(e.message())
 // ```
 pub fn parse_pri(octets: [u8]) -> Result<(SyslogPri, Int), SyslogError>
-    todo("syslog-nv.syslogpri.parse_pri")
+    let len = list.len(octets)
+    if byte_at(octets, 0) != '<'
+        return Err(SyslogBadPri(0))
+    var i = 1
+    var value = 0
+    var digits = 0
+    while i < len and is_digit(byte_at(octets, i))
+        // Held below a billion so a long run of digits cannot wrap;
+        // every value that long is refused as too large anyway.
+        if value < 1000000000
+            value = value * 10 + (byte_at(octets, i) - '0')
+        digits += 1
+        i += 1
+    if digits == 0
+        return Err(SyslogBadPri(1))
+    if byte_at(octets, i) != '>'
+        return Err(SyslogBadPri(i))
+    // `<09>` is not another spelling of `<9>` (RFC 5424 § 6.2.1).  One
+    // digit of `0` is the priority zero and not a padding.
+    if digits > 1 and byte_at(octets, 1) == '0'
+        return Err(SyslogPriHasLeadingZero(1))
+    let p = from_prival(value)!
+    Ok((p, i + 1))
 
 // A priority written the way both formats begin: `<`, the value, `>`.
 //
@@ -374,4 +539,4 @@ pub fn parse_pri(octets: [u8]) -> Result<(SyslogPri, Int), SyslogError>
 //     println(syslogpri.format_pri(syslogpri.pri(SyslogFacAuth, SyslogSevNotice)))   // <37>
 // ```
 pub fn format_pri(p: SyslogPri) -> Str
-    todo("syslog-nv.syslogpri.format_pri")
+    "<" + str.from_int(prival(p)) + ">"

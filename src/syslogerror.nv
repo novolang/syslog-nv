@@ -1,8 +1,6 @@
 // syslogerror.nv — every way syslog octets can refuse to be read or
 // written, and the one division that changes what a receiver does next.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A FRAMING FAULT IS NOT A MESSAGE FAULT
 //
 // These two things look alike in a log and are not alike at all.
@@ -153,9 +151,50 @@ impl Error for SyslogError
     // It says what was found and what was expected, in the RFCs'
     // words, and names the octet where a positional fault was found.
     //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("syslog-nv.SyslogError.message")
+        match self
+            SyslogBadPri(at)                              =>
+                "syslog: no priority at octet ${at} — expected `<`, digits, `>`"
+            SyslogPriValueTooLarge(prival)                =>
+                "syslog: the priority value ${prival} is above 191, so it names a facility above 23"
+            SyslogPriHasLeadingZero(at)                   =>
+                "syslog: the priority at octet ${at} has a leading zero — `<9>`, never `<09>`"
+            SyslogNotVersion1(found)                      =>
+                "syslog: VERSION is `${found}` — RFC 5424 defines version 1 and no other"
+            SyslogBadTimestamp(at, why)                   =>
+                "syslog: the TIMESTAMP at octet ${at} is not ${why}"
+            SyslogTimestampTooPrecise(digits)             =>
+                "syslog: ${digits} fractional digits — RFC 5424 6.2.3.1 allows at most six"
+            SyslogTimestampIncomplete(missing)            =>
+                "syslog: this syntax needs a ${missing}, which the timestamp does not carry"
+            SyslogFieldTooLong(field, octets, max_octets) =>
+                "syslog: ${field} is ${octets} octets and the limit is ${max_octets}"
+            SyslogFieldNotPrintable(field, at)            =>
+                "syslog: ${field} holds an octet outside PRINTUSASCII at octet ${at}"
+            SyslogFieldEmpty(field)                       =>
+                "syslog: ${field} is empty — a field with nothing in it is written `-`"
+            SyslogBadStructuredData(at, why)              =>
+                "syslog: structured data at octet ${at} — expected ${why}"
+            SyslogSdNameInvalid(name)                     =>
+                "syslog: `${name}` is not an SD-NAME — one to thirty-two printable US-ASCII, none of `= ] \"` or space"
+            SyslogSdIdRepeated(id)                        =>
+                "syslog: the SD-ID `${id}` appears twice, and RFC 5424 6.3.2 forbids it"
+            SyslogSdIdNotRegistered(id)                   =>
+                "syslog: the bare SD-ID `${id}` is not one of timeQuality, origin or meta, and IANA reserves the rest"
+            SyslogBadTag(at)                              =>
+                "syslog: the TAG at octet ${at} is longer than 32 alphanumeric characters"
+            SyslogMessageTooLong(octets, max_octets)      =>
+                "syslog: ${octets} octets is over the ${max_octets} of RFC 3164 4.1"
+            SyslogMsgNotUtf8(at)                          =>
+                "syslog: the MSG is declared UTF-8 and octet ${at} is not"
+            SyslogBadFrameLength(at)                      =>
+                "syslog: the MSG-LEN at octet ${at} is not a non-zero digit followed by digits and a space"
+            SyslogFrameTooLarge(octets, max_octets)       =>
+                "syslog: a frame of ${octets} octets is over the reader's limit of ${max_octets}"
+            SyslogFrameTruncated(at)                      =>
+                "syslog: the stream ended at octet ${at} inside an octet-counted frame"
+            SyslogTrailerInMessage(at)                    =>
+                "syslog: octet ${at} is the trailer, and non-transparent framing has no escape for it"
 
 // Whether this fault means the receiver has lost its place in the
 // stream.
@@ -181,7 +220,13 @@ impl Error for SyslogError
 //     println("${syslogerror.is_framing_fault(wrong_version)}")             // false
 // ```
 pub fn is_framing_fault(e: SyslogError) -> Bool
-    todo("syslog-nv.syslogerror.is_framing_fault")
+    match e
+        SyslogBadFrameLength(_)    => true
+        SyslogFrameTooLarge(_, _)  => true
+        SyslogFrameTruncated(_)    => true
+        SyslogTrailerInMessage(_)  => true
+        SyslogMessageTooLong(_, _) => true
+        _                          => false
 
 // The octet this fault was found at, counted from the first octet the
 // reader was ever given, or `-1`.
@@ -199,7 +244,23 @@ pub fn is_framing_fault(e: SyslogError) -> Bool
 //     println("${syslogerror.offset_of(SyslogPriValueTooLarge(200))}")       // -1
 // ```
 pub fn offset_of(e: SyslogError) -> Int
-    todo("syslog-nv.syslogerror.offset_of")
+    match e
+        // The variants whose name carries the octet they were found
+        // at, in the order the enum declares them.
+        SyslogBadPri(at)               => at
+        SyslogPriHasLeadingZero(at)    => at
+        SyslogBadTimestamp(at, _)      => at
+        SyslogFieldNotPrintable(_, at) => at
+        SyslogBadStructuredData(at, _) => at
+        SyslogBadTag(at)               => at
+        SyslogMsgNotUtf8(at)           => at
+        SyslogBadFrameLength(at)       => at
+        SyslogFrameTruncated(at)       => at
+        SyslogTrailerInMessage(at)     => at
+        // Everything else describes a value rather than a place: a
+        // priority that is too large, a field that is too long, a
+        // timestamp missing its year, a frame larger than the limit.
+        _                              => -1
 
 // A short stable code for metrics and logs: `"bad_pri"`,
 // `"frame_truncated"`, `"sd_id_repeated"`, and so on.
@@ -216,4 +277,25 @@ pub fn offset_of(e: SyslogError) -> Int
 //     println(syslogerror.code(SyslogFrameTruncated(4812)))     // frame_truncated
 // ```
 pub fn code(e: SyslogError) -> Str
-    todo("syslog-nv.syslogerror.code")
+    match e
+        SyslogBadPri(_)               => "bad_pri"
+        SyslogPriValueTooLarge(_)     => "pri_value_too_large"
+        SyslogPriHasLeadingZero(_)    => "pri_has_leading_zero"
+        SyslogNotVersion1(_)          => "not_version_1"
+        SyslogBadTimestamp(_, _)      => "bad_timestamp"
+        SyslogTimestampTooPrecise(_)  => "timestamp_too_precise"
+        SyslogTimestampIncomplete(_)  => "timestamp_incomplete"
+        SyslogFieldTooLong(_, _, _)   => "field_too_long"
+        SyslogFieldNotPrintable(_, _) => "field_not_printable"
+        SyslogFieldEmpty(_)           => "field_empty"
+        SyslogBadStructuredData(_, _) => "bad_structured_data"
+        SyslogSdNameInvalid(_)        => "sd_name_invalid"
+        SyslogSdIdRepeated(_)         => "sd_id_repeated"
+        SyslogSdIdNotRegistered(_)    => "sd_id_not_registered"
+        SyslogBadTag(_)               => "bad_tag"
+        SyslogMessageTooLong(_, _)    => "message_too_long"
+        SyslogMsgNotUtf8(_)           => "msg_not_utf8"
+        SyslogBadFrameLength(_)       => "bad_frame_length"
+        SyslogFrameTooLarge(_, _)     => "frame_too_large"
+        SyslogFrameTruncated(_)       => "frame_truncated"
+        SyslogTrailerInMessage(_)     => "trailer_in_message"

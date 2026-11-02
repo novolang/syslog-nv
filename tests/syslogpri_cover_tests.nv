@@ -1,0 +1,149 @@
+// syslogpri_cover_tests.nv — all twenty-four facilities and all eight
+// severities, not just the ones an example message used.
+//
+// Added while landing the package.  The API suite asserts the
+// arithmetic against RFC 5424 § 6.5's examples, which reach four
+// facilities and three severities; the other arms of the tables are
+// asserted here, so that a table entry that moved would be caught by
+// the suite and not by a user.
+
+use std.test
+use syslogpri
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+fn every_facility() -> [SyslogFacility]
+    [SyslogFacKern, SyslogFacUser, SyslogFacMail, SyslogFacDaemon,
+     SyslogFacAuth, SyslogFacSyslog, SyslogFacLpr, SyslogFacNews,
+     SyslogFacUucp, SyslogFacCron, SyslogFacAuthPriv, SyslogFacFtp,
+     SyslogFacNtp, SyslogFacAudit, SyslogFacAlert, SyslogFacCron2,
+     SyslogFacLocal0, SyslogFacLocal1, SyslogFacLocal2, SyslogFacLocal3,
+     SyslogFacLocal4, SyslogFacLocal5, SyslogFacLocal6, SyslogFacLocal7]
+
+fn every_severity() -> [SyslogSeverity]
+    [SyslogSevEmergency, SyslogSevAlert, SyslogSevCritical, SyslogSevError,
+     SyslogSevWarning, SyslogSevNotice, SyslogSevInformational, SyslogSevDebug]
+
+@test
+fn test_all_twenty_four_facilities_carry_the_number_the_table_gives() [io]
+    // RFC 5424 § 6.2.1, Table 1, in its own order.  The list is written
+    // out in the table's order, so the index IS the number.
+    test.case("each facility's number is its place in Table 1")
+    let facilities = every_facility()
+    test.assert(list.len(facilities) == 24)
+    for i in 0..24
+        test.assert(syslogpri.facility_number(list.get(facilities, i)) == i)
+
+    test.case("and the number reads back as the same facility")
+    var k = 0
+    while k < 24
+        match syslogpri.facility_from_number(k)
+            Err(_) => test.fail("every number up to 23 names a facility")
+            Ok(f)  => test.assert(syslogpri.facility_number(f) == k)
+        k += 1
+
+    test.case("and every one of them has a description to print")
+    for j in 0..24
+        test.assert(not str.is_empty(syslogpri.facility_description(list.get(facilities, j))))
+
+    test.case("including 15, which is the second clock daemon")
+    test.assert(syslogpri.facility_number(SyslogFacCron2) == 15)
+
+@test
+fn test_all_eight_severities_carry_the_number_and_name_the_table_gives() [io]
+    // RFC 5424 § 6.2.1, Table 2.  Emergency is 0 and Debug is 7, and
+    // the names are the table's.
+    test.case("each severity's number is its place in Table 2")
+    let severities = every_severity()
+    test.assert(list.len(severities) == 8)
+    for i in 0..8
+        test.assert(syslogpri.severity_number(list.get(severities, i)) == i)
+
+    test.case("and the number reads back as the same severity")
+    var k = 0
+    while k < 8
+        match syslogpri.severity_from_number(k)
+            Err(_) => test.fail("every number up to 7 names a severity")
+            Ok(s)  => test.assert(syslogpri.severity_number(s) == k)
+        k += 1
+
+    test.case("Table 2's eight names, in its order")
+    let names = ["Emergency", "Alert", "Critical", "Error",
+                 "Warning", "Notice", "Informational", "Debug"]
+    for j in 0..8
+        test.assert(syslogpri.severity_name(list.get(severities, j)) == list.get(names, j))
+        match syslogpri.severity_from_name(str.lower(list.get(names, j)))
+            None    => test.fail("that is one of the eight names")
+            Some(s) => test.assert(syslogpri.severity_number(s) == j)
+
+@test
+fn test_a_severity_name_is_read_without_regard_to_case() [io]
+    // A configuration file that says `level = "warning"` is the caller
+    // `severity_from_name` exists for.
+    test.case("the lower-case spelling of each name is that severity")
+    let lower = ["emergency", "alert", "critical", "error",
+                 "notice", "informational", "debug"]
+    let numbers = [0, 1, 2, 3, 5, 6, 7]
+    for i in 0..7
+        match syslogpri.severity_from_name(list.get(lower, i))
+            None    => test.fail("that is one of Table 2's names")
+            Some(s) => test.assert(syslogpri.severity_number(s) == list.get(numbers, i))
+
+    test.case("and an upper-case one is the same severity")
+    match syslogpri.severity_from_name("WARNING")
+        None    => test.fail("`WARNING` is `Warning`")
+        Some(s) => test.assert(syslogpri.severity_number(s) == 4)
+
+    test.case("while a word that is not one of the eight is None")
+    match syslogpri.severity_from_name("verbose")
+        Some(_) => test.fail("`verbose` is not a syslog severity")
+        None    => test.assert(true)
+
+@test
+fn test_a_priority_that_is_not_written_right_is_refused_where_it_stands() [io]
+    // The octet a fault names is what a person reads, so each refusal
+    // here is asserted at its own position rather than merely refused.
+    test.case("octets that do not begin with `<`")
+    match syslogpri.parse_pri(octets_of("x34>"))
+        Ok(_)                 => test.fail("a priority begins with `<`")
+        Err(SyslogBadPri(at)) => test.assert(at == 0)
+        Err(_)                => test.fail("wrong reason")
+
+    test.case("and neither does an empty buffer")
+    match syslogpri.parse_pri([])
+        Ok(_)                 => test.fail("there is no priority in no octets")
+        Err(SyslogBadPri(at)) => test.assert(at == 0)
+        Err(_)                => test.fail("wrong reason")
+
+    test.case("a `<` with no digits is refused where the digits should be")
+    match syslogpri.parse_pri(octets_of("<>"))
+        Ok(_)                 => test.fail("a priority needs digits")
+        Err(SyslogBadPri(at)) => test.assert(at == 1)
+        Err(_)                => test.fail("wrong reason")
+
+    test.case("and so is a buffer that ends before the `>`")
+    match syslogpri.parse_pri(octets_of("<34"))
+        Ok(_)                 => test.fail("a priority is closed by `>`")
+        Err(SyslogBadPri(at)) => test.assert(at == 3)
+        Err(_)                => test.fail("wrong reason")
+
+    test.case("digits that are not closed by `>` name where the `>` is missing")
+    match syslogpri.parse_pri(octets_of("<34 x"))
+        Ok(_)                 => test.fail("`<34 ` is not a priority")
+        Err(SyslogBadPri(at)) => test.assert(at == 3)
+        Err(_)                => test.fail("wrong reason")
+
+    test.case("a value above 191 is refused by the arithmetic, not by the digits")
+    match syslogpri.parse_pri(octets_of("<192>"))
+        Ok(_)                          => test.fail("192 names no facility")
+        Err(SyslogPriValueTooLarge(v)) => test.assert(v == 192)
+        Err(_)                         => test.fail("wrong reason")
+
+    test.case("and a run of digits long enough to wrap is still refused")
+    // The accumulator stops growing at a billion, so twenty digits
+    // cannot become a small number by wrapping.
+    match syslogpri.parse_pri(octets_of("<99999999999999999999>"))
+        Ok(_)  => test.fail("that is far past 191")
+        Err(_) => test.assert(true)

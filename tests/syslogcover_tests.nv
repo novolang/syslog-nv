@@ -1,9 +1,6 @@
 // syslogcover_tests.nv — the message value, and the rest of the public
 // surface with one case each.
 //
-// RED ON PURPOSE, like every suite here: each assertion reaches `not
-// implemented: syslog-nv.<module>.<fn>`.
-//
 // The four suites beside this one assert the two formats, the
 // structured data and the framing.  This one asserts the value they all
 // produce, and exists so that no public function ships without a

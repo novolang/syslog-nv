@@ -1,8 +1,7 @@
 // syslogsd_tests.nv — the API suite for structured data.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// syslog-nv.syslogsd.<fn>`.  What is asserted is RFC 5424 § 6.3.3's
-// escaping, both halves of it, and the rules § 6.3.2 puts on names.
+// What is asserted is RFC 5424 § 6.3.3's escaping, both halves of it,
+// and the rules § 6.3.2 puts on names.
 
 use std.test
 use syslogsd

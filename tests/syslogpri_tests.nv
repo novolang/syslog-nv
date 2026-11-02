@@ -1,9 +1,8 @@
 // syslogpri_tests.nv — the API suite for the priority.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// syslog-nv.syslogpri.<fn>`.  What is asserted is the arithmetic of
-// RFC 5424 § 6.2.1 against the RFCs' own example messages, and the one
-// comparison everybody writes backwards.
+// What is asserted is the arithmetic of RFC 5424 § 6.2.1 against the
+// RFCs' own example messages, and the one comparison everybody writes
+// backwards.
 
 use std.test
 use syslogpri

@@ -1,15 +1,10 @@
 [package]
 name        = "syslog-nv"
-version     = "0.0.1"
-description = "Syslog in both of its formats: RFC 5424 with its structured data, and the older BSD form of RFC 3164, each parsed and formatted.  The priority is decomposed into a typed facility and a typed severity, structured-data parameter values are escaped to RFC 5424 § 6.3.3 exactly, and the two RFC 6587 framings — octet counting and non-transparent — are a feed-and-drain reader over bytes.  No socket, no clock.  Interface only: every body is a todo()."
+version     = "0.1.0"
+description = "Syslog in both of its formats: RFC 5424 with its structured data, and the older BSD form of RFC 3164, each parsed and formatted.  The priority is decomposed into a typed facility and a typed severity, structured-data parameter values are escaped to RFC 5424 § 6.3.3 exactly, and the two RFC 6587 framings — octet counting and non-transparent — are a feed-and-drain reader over bytes.  No socket, no clock."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `core`: bytes in, values out, and nothing performs anything.
 #
@@ -36,7 +31,7 @@ category    = "networking"
 tags        = ["syslog", "rfc-5424", "rfc-3164", "rfc-6587", "logging", "structured-data", "framing", "sans-io", "codec"]
 repository  = "https://github.com/novolang/syslog-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.9.0"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

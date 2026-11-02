@@ -1,0 +1,332 @@
+// syslogmsg_cover_tests.nv — the UTF-8 reader's ranges, the TAG rule,
+// and the RFC 3164 size arithmetic, each arm at a time.
+//
+// Added while landing the package.  The API suites reach the paths
+// their example messages take; this one walks every range RFC 3629
+// gives the first octet of a sequence, both halves of the TAG check,
+// and the arithmetic that adds a message up.  A validator is worth
+// nothing if only one of its ranges has ever been tried, and a length
+// rule is worth nothing if only the short side has.
+
+use std.test
+use syslogmsg
+use syslogpri
+use syslogsd
+use syslogerror
+use syslog3164
+use syslog5424
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+// RFC 5424 § 6.4's byte order mark: the declaration that a MSG is
+// UTF-8 and not merely octets.
+fn bom() -> [u8]
+    [0xEF as u8, 0xBB as u8, 0xBF as u8]
+
+// One RFC 5424 message whose MSG is these octets, marked UTF-8.
+//
+// The header is § 6.5's first example message with every field the
+// NILVALUE, so the only thing under test is what follows the mark —
+// which is where `msg_text` has to make its decision.
+fn wire_with_msg(body: [u8]) -> [u8]
+    let head = octets_of("<34>1 2003-10-11T22:14:15Z - - - - - ")
+    list.concat(head, list.concat(bom(), body))
+
+// What `msg_text` answers for a message that arrived carrying that
+// MSG.  A `None` here is the interesting answer, so the cases below
+// that mean to provoke one also assert that the parse itself
+// succeeded — otherwise a refused header would look like a refused
+// encoding.
+fn text_of_wire(body: [u8]) -> ?Str
+    match syslog5424.parse(wire_with_msg(body))
+        Err(_) => None
+        Ok(m)  => syslogmsg.msg_text(m)
+
+// An RFC 3164-shaped message built by hand, which is how a caller
+// checks a value it assembled itself (`syslogmsg.check` is public for
+// exactly that).  A parsed RFC 3164 message cannot carry a bad TAG —
+// the reader truncates instead of refusing — so the refusals below
+// can only be reached this way.
+fn rfc3164_message(hostname: Str, app_name: Str, msg: [u8]) -> SyslogMessage
+    let no_sd = [] as [SyslogSdElement]
+    SyslogMessage {
+        pri: syslogpri.pri(SyslogFacUser, SyslogSevNotice),
+        format: SyslogFormatRfc3164,
+        timestamp: None,
+        hostname: hostname,
+        app_name: app_name,
+        procid: "",
+        msgid: "",
+        structured_data: no_sd,
+        msg: msg,
+        msg_utf8: false }
+
+@test
+fn test_the_utf8_reader_accepts_every_sequence_length() [io]
+    // The octets are the ones RFC 3629's table gives each length, plus
+    // the range ends of the three special first octets: E0, which may
+    // not carry an overlong three-octet form; ED, which may not encode
+    // a surrogate; F0, which may not carry an overlong four-octet
+    // form; and F4, which may not go past U+10FFFF.
+    test.case("the shortest two-octet sequence")
+    match text_of_wire([0xC3 as u8, 0xA9 as u8])
+        None    => test.fail("`C3 A9` is `é`, and the MSG declared itself UTF-8")
+        Some(_) => test.assert(true)
+
+    test.case("a three-octet sequence, and one starting at E0's floor")
+    match text_of_wire([0xE2 as u8, 0x82 as u8, 0xAC as u8])
+        None    => test.fail("`E2 82 AC` is `€`")
+        Some(_) => test.assert(true)
+    match text_of_wire([0xE0 as u8, 0xA0 as u8, 0x80 as u8])
+        None    => test.fail("E0 A0 80 is U+0800, the lowest three-octet character")
+        Some(_) => test.assert(true)
+
+    test.case("a surrogate's neighbours, which are legal")
+    match text_of_wire([0xED as u8, 0x9F as u8, 0xBF as u8])
+        None    => test.fail("ED 9F BF is U+D7FF, just below the surrogates")
+        Some(_) => test.assert(true)
+    match text_of_wire([0xEE as u8, 0x80 as u8, 0x80 as u8])
+        None    => test.fail("EE 80 80 is U+E000, just above them")
+        Some(_) => test.assert(true)
+    match text_of_wire([0xEF as u8, 0xBF as u8, 0xBF as u8])
+        None    => test.fail("EF BF BF is U+FFFF")
+        Some(_) => test.assert(true)
+
+    test.case("a four-octet sequence, at F0's floor and F4's ceiling")
+    match text_of_wire([0xF0 as u8, 0x90 as u8, 0x80 as u8, 0x80 as u8])
+        None    => test.fail("F0 90 80 80 is U+10000, the lowest four-octet character")
+        Some(_) => test.assert(true)
+    match text_of_wire([0xF1 as u8, 0x80 as u8, 0x80 as u8, 0x80 as u8])
+        None    => test.fail("F1 80 80 80 is U+40000")
+        Some(_) => test.assert(true)
+    match text_of_wire([0xF3 as u8, 0xBF as u8, 0xBF as u8, 0xBF as u8])
+        None    => test.fail("F3 BF BF BF is U+FFFFF")
+        Some(_) => test.assert(true)
+    match text_of_wire([0xF4 as u8, 0x8F as u8, 0xBF as u8, 0xBF as u8])
+        None    => test.fail("F4 8F BF BF is U+10FFFF, the last character there is")
+        Some(_) => test.assert(true)
+
+    test.case("and a run of them, so the walk moves by each sequence's length")
+    match text_of_wire([0x41 as u8, 0xC3 as u8, 0xA9 as u8, 0xE2 as u8, 0x82 as u8, 0xAC as u8,
+                        0xF0 as u8, 0x90 as u8, 0x80 as u8, 0x80 as u8, 0x42 as u8])
+        None    => test.fail("that run is entirely well-formed")
+        Some(_) => test.assert(true)
+
+@test
+fn test_the_utf8_reader_refuses_each_range_at_its_own_edge() [io]
+    test.case("a continuation octet with nothing to continue")
+    match text_of_wire([0x80 as u8])
+        Some(_) => test.fail("a continuation octet outside a sequence is not a character")
+        None    => test.assert(true)
+
+    test.case("the two-octet overlong forms, and the first octet past the range")
+    match text_of_wire([0xC0 as u8, 0xAF as u8])
+        Some(_) => test.fail("C0 AF is an overlong `/`, and RFC 3629 forbids it")
+        None    => test.assert(true)
+    match text_of_wire([0xC1 as u8, 0xBF as u8])
+        Some(_) => test.fail("C1 BF is overlong too")
+        None    => test.assert(true)
+    match text_of_wire([0xF5 as u8, 0x80 as u8, 0x80 as u8, 0x80 as u8])
+        Some(_) => test.fail("F5 starts a value above U+10FFFF")
+        None    => test.assert(true)
+    match text_of_wire([0xFF as u8])
+        Some(_) => test.fail("FF is not a leading octet at all")
+        None    => test.assert(true)
+
+    test.case("a two-octet sequence cut off by the end of the MSG")
+    match text_of_wire([0xC3 as u8])
+        Some(_) => test.fail("C3 with nothing after it is not a character")
+        None    => test.assert(true)
+
+    test.case("a continuation octet below the range the leader allows")
+    match text_of_wire([0xC3 as u8, 0x41 as u8])
+        Some(_) => test.fail("41 is ASCII, not a continuation octet")
+        None    => test.assert(true)
+
+    test.case("E0 followed by a byte that would make it an overlong form")
+    match text_of_wire([0xE0 as u8, 0x9F as u8, 0xBF as u8])
+        Some(_) => test.fail("E0 9F BF is the overlong form of U+07FF")
+        None    => test.assert(true)
+
+    test.case("and E0 with a good second octet but no third")
+    match text_of_wire([0xE0 as u8, 0xA0 as u8, 0x41 as u8])
+        Some(_) => test.fail("the third octet has to be a continuation")
+        None    => test.assert(true)
+
+    test.case("a three-octet sequence whose second octet is ASCII")
+    match text_of_wire([0xE1 as u8, 0x41 as u8, 0x41 as u8])
+        Some(_) => test.fail("41 is not a continuation octet")
+        None    => test.assert(true)
+
+    test.case("ED at A0, which is how a surrogate is spelled")
+    match text_of_wire([0xED as u8, 0xA0 as u8, 0x80 as u8])
+        Some(_) => test.fail("ED A0 80 is U+D800, and UTF-8 may not encode a surrogate")
+        None    => test.assert(true)
+
+    test.case("and ED with a good second octet but a bad third")
+    match text_of_wire([0xED as u8, 0x9F as u8, 0x41 as u8])
+        Some(_) => test.fail("the third octet has to be a continuation")
+        None    => test.assert(true)
+
+    test.case("EF with a good second octet but a bad third")
+    match text_of_wire([0xEF as u8, 0x80 as u8, 0x41 as u8])
+        Some(_) => test.fail("the third octet has to be a continuation")
+        None    => test.assert(true)
+
+    test.case("F0 below 90, which is the overlong four-octet form")
+    match text_of_wire([0xF0 as u8, 0x8F as u8, 0xBF as u8, 0xBF as u8])
+        Some(_) => test.fail("F0 8F BF BF is the overlong form of U+FFFF")
+        None    => test.assert(true)
+
+    test.case("and F0 with a good second octet but the rest not continuations")
+    match text_of_wire([0xF0 as u8, 0x90 as u8, 0x41 as u8, 0x41 as u8])
+        Some(_) => test.fail("the last two octets have to be continuations")
+        None    => test.assert(true)
+
+    test.case("a four-octet leader cut off after one octet")
+    match text_of_wire([0xF1 as u8, 0x80 as u8])
+        Some(_) => test.fail("that sequence is two octets short")
+        None    => test.assert(true)
+
+    test.case("F4 above 8F, which is how a value past U+10FFFF is spelled")
+    match text_of_wire([0xF4 as u8, 0x90 as u8, 0x80 as u8, 0x80 as u8])
+        Some(_) => test.fail("F4 90 80 80 is U+110000, and there is no such character")
+        None    => test.assert(true)
+
+    test.case("and F4 with a good second octet but the rest not continuations")
+    match text_of_wire([0xF4 as u8, 0x8F as u8, 0x41 as u8, 0x41 as u8])
+        Some(_) => test.fail("the last two octets have to be continuations")
+        None    => test.assert(true)
+
+@test
+fn test_a_receiver_tells_a_message_that_is_not_text_from_one_that_never_claimed() [io]
+    // The difference `msg_utf8` exists to carry: a MSG that arrived
+    // marked UTF-8 and is not is a message whose bytes are the evidence,
+    // and `msg_text` answers `None` rather than a replacement character.
+    test.case("the fixture is one the parser accepts, and the mark came off")
+    match syslog5424.parse(wire_with_msg([0x80 as u8]))
+        Err(e) => test.fail("that header is well-formed")
+        Ok(m)  =>
+            test.assert(m.msg_utf8)
+            test.assert(list.len(m.msg) == 1)
+
+    test.case("so the octets rather than the header are what is refused")
+    match text_of_wire([0x80 as u8])
+        Some(_) => test.fail("a lone continuation octet is not text")
+        None    => test.assert(true)
+
+    test.case("while a MSG that never claimed UTF-8 is not text either")
+    let m = syslogmsg.with_msg_bytes(
+                syslogmsg.message(syslogpri.pri(SyslogFacUser, SyslogSevNotice)),
+                [0xC3 as u8, 0xA9 as u8])
+    test.assert(not m.msg_utf8)
+    match syslogmsg.msg_text(m)
+        Some(_) => test.fail("octets that went in as octets are not text")
+        None    => test.assert(true)
+
+@test
+fn test_an_rfc3164_message_is_checked_by_the_rules_of_its_own_format() [io]
+    test.case("§ 4.1's example message is writable as it stands")
+    // `<34>Oct 11 22:14:15 mymachine su[1234]: failed` — a hostname, a
+    // TAG, and the bracketed number `tagged_content` lifts out of it,
+    // so every part of the size arithmetic has something to add.
+    match syslog3164.parse(octets_of("<34>Oct 11 22:14:15 mymachine su[1234]: failed"))
+        Err(_) => test.fail("that is RFC 3164 § 4.1's own example")
+        Ok(m)  =>
+            test.assert(m.app_name == "su")
+            test.assert(m.procid == "1234")
+            match syslogmsg.check(m)
+                Some(e) => test.fail("nothing in that message breaks a rule")
+                None    => test.assert(true)
+
+    test.case("a relaxed message with no TAG and no timestamp is still writable")
+    // What a relay gets from a daemon that never wrote syslog at all:
+    // one whole packet of content, an empty HEADER, and no stamp to add
+    // sixteen octets for.
+    let junk = syslog3164.parse_relaxed(octets_of("something went wrong"), syslog3164.default_pri())
+    match syslogmsg.check(junk)
+        Some(e) => test.fail("an empty TAG is allowed by § 4.1.3")
+        None    => test.assert(true)
+
+@test
+fn test_a_tag_that_is_not_thirty_two_alphanumerics_is_refused_by_check() [io]
+    // § 4.1.3: the TAG is alphanumeric and at most thirty-two
+    // characters.  The reader truncates a longer run rather than
+    // refusing it, so these two refusals are a writer's, reported where
+    // the value was built.
+    test.case("a character that is not alphanumeric, at its own position")
+    match syslogmsg.check(rfc3164_message("mymachine", "a b", [] as [u8]))
+        None                   => test.fail("a space is not alphanumeric")
+        Some(SyslogBadTag(at)) => test.assert(at == 1)
+        Some(e)                => test.assert(syslogerror.code(e) == "bad_tag")
+
+    test.case("and a run longer than the thirty-two § 4.1.3 allows")
+    match syslogmsg.check(rfc3164_message("mymachine", str.repeat("a", 33), [] as [u8]))
+        None                   => test.fail("thirty-three is over the limit")
+        Some(SyslogBadTag(at)) => test.assert(at == -1)
+        Some(e)                => test.assert(syslogerror.code(e) == "bad_tag")
+
+    test.case("while thirty-two of them are exactly what is allowed")
+    match syslogmsg.check(rfc3164_message("mymachine", str.repeat("a", 32), [] as [u8]))
+        Some(e) => test.fail("thirty-two is the limit, not one past it")
+        None    => test.assert(true)
+
+@test
+fn test_the_rfc3164_arithmetic_refuses_a_message_over_its_own_cap() [io]
+    // § 4.1 caps the whole message at 1024 octets, and the only place
+    // the number is known is where the parts are added up.
+    test.case("1024 octets of content with a header on top of them")
+    // No hostname and no TAG, so the header is `<13>` and the count is
+    // 2 + 2 + 1024 — the arithmetic the cap is applied to.
+    let content = bytes.to_byte_list(bytes.from_str(str.repeat("x", 1024)))
+    match syslogmsg.check(rfc3164_message("", "", content))
+        None                                   => test.fail("§ 4.1 allows 1024 octets in all")
+        Some(SyslogMessageTooLong(total, max)) =>
+            test.assert(total == 1028)
+            test.assert(max == 1024)
+        Some(_)                                => test.fail("wrong reason for a long message")
+
+    test.case("and content that just fits is writable")
+    let fits = bytes.to_byte_list(bytes.from_str(str.repeat("x", 1020)))
+    match syslogmsg.check(rfc3164_message("", "", fits))
+        Some(_) => test.fail("1024 octets is the cap, and the cap is not over it")
+        None    => test.assert(true)
+
+@test
+fn test_a_timestamp_refusal_names_the_part_that_is_out_of_range() [io]
+    test.case("a day of the month of 32")
+    match syslogmsg.timestamp(Some(2003), 10, 32, 0, 0, 0, 0, Some(0))
+        Ok(_)  => test.fail("there is no 32nd of October")
+        Err(e) => test.assert(str.contains(e.message(), "day of the month"))
+
+    test.case("a minute of 60")
+    match syslogmsg.timestamp(Some(2003), 10, 11, 22, 60, 0, 0, Some(0))
+        Ok(_)  => test.fail("the minute runs 0 to 59")
+        Err(e) => test.assert(str.contains(e.message(), "minute between 0 and 59"))
+
+    test.case("and a fraction below zero, which is refused by its digit count")
+    match syslogmsg.timestamp(Some(2003), 10, 11, 22, 14, 15, -1, Some(0))
+        Ok(_)                                  => test.fail("a fraction is zero or more")
+        Err(SyslogTimestampTooPrecise(digits)) => test.assert(digits == 1)
+        Err(_)                                 => test.fail("wrong reason for a negative fraction")
+
+@test
+fn test_octets_that_are_neither_dialect_are_answered_not_guessed() [io]
+    // The dialect probe looks at four octets and parses nothing else, so
+    // what it does at the end of the buffer is what a collector meets
+    // when a packet was cut short.
+    test.case("a priority and nothing after it")
+    match syslogmsg.detect_format(octets_of("<34>"))
+        Some(_) => test.fail("`<34>` alone is a prefix of both dialects")
+        None    => test.assert(true)
+
+    test.case("a priority and one letter, which is no month abbreviation")
+    match syslogmsg.detect_format(octets_of("<34>x"))
+        Some(_) => test.fail("a month is three letters")
+        None    => test.assert(true)
+
+    test.case("a version that is not followed by the space § 6.2.2 puts there")
+    match syslogmsg.detect_format(octets_of("<34>1x"))
+        Some(_) => test.fail("`1x` is neither `1 ` nor a month")
+        None    => test.assert(true)

@@ -1,8 +1,6 @@
 // syslogmsg.nv — one message value for both formats, and a timestamp
 // whose year is allowed to be missing.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // ONE VALUE, TWO FORMATS
 //
 // RFC 5424 and RFC 3164 describe the same thing twice.  Both messages
@@ -59,6 +57,237 @@
 use syslogpri
 use syslogsd
 use syslogerror
+
+// Whether a byte is an ASCII digit.
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// Whether a byte is an ASCII letter.
+fn is_letter(b: Int) -> Bool
+    b >= 'A' and b <= 'Z' or b >= 'a' and b <= 'z'
+
+// The byte at an offset, or -1 past the end.
+//
+// A reader in this package walks octets that arrived from a network,
+// so every one of them is bounds-checked and past the end is a value
+// rather than a panic.
+fn byte_at(octets: [u8], i: Int) -> Int
+    if i < 0 or i >= list.len(octets)
+        return -1
+    octets[i] as Int
+
+// The byte at an offset of a `Str`, or -1 past the end.
+fn char_at(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, -1)
+
+// How many decimal digits a value needs, the number 0 being one digit.
+fn digit_count(n: Int) -> Int
+    var m = n
+    if m < 0
+        m = -m
+    var digits = 1
+    while m >= 10
+        m = m / 10
+        digits += 1
+    digits
+
+// The octets of a `Str`.
+fn octets_of(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+// Whether `count` octets at `from` are all continuation octets in the
+// range this sequence's first octet allows.
+fn continuation(octets: [u8], from: Int, to: Int, count: Int, low: Int, high: Int) -> Bool
+    var k = 0
+    while k < count
+        let b = byte_at(octets, from + k)
+        if from + k >= to or b < low or b > high
+            return false
+        k += 1
+    true
+
+// Whether the octets from `from` are well-formed UTF-8, and the offset
+// of the first octet that is not.
+//
+// RFC 5424 § 6.4 lets a MSG hold any octet and says a MSG that begins
+// with the byte order mark is UTF-8, so this is the question
+// `msg_text` is built on.  The rules are RFC 3629's: a sequence is
+// well-formed only if its length is the one the first octet declares,
+// every continuation octet is 0x80 to 0xBF, no overlong form is used
+// (which is why 0xC0 and 0xC1 are refused outright) and no surrogate
+// or value above U+10FFFF is encoded.  It answers -1 when the whole
+// run is valid, so a caller can treat it as "the first bad octet, or
+// none".
+fn first_bad_utf8(octets: [u8], from: Int, to: Int) -> Int
+    var i = from
+    while i < to
+        let b = byte_at(octets, i)
+        if b < 0x80
+            i += 1
+        elif b >= 0xC2 and b <= 0xDF
+            if not continuation(octets, i + 1, to, 1, 0x80, 0xBF)
+                return i
+            i += 2
+        elif b == 0xE0
+            if not continuation(octets, i + 1, to, 1, 0xA0, 0xBF)
+                return i
+            if not continuation(octets, i + 2, to, 1, 0x80, 0xBF)
+                return i
+            i += 3
+        elif b >= 0xE1 and b <= 0xEC
+            if not continuation(octets, i + 1, to, 2, 0x80, 0xBF)
+                return i
+            i += 3
+        elif b == 0xED
+            // U+D800 to U+DFFF are surrogates and UTF-8 may not
+            // encode them, which caps this octet at 0x9F.
+            if not continuation(octets, i + 1, to, 1, 0x80, 0x9F)
+                return i
+            if not continuation(octets, i + 2, to, 1, 0x80, 0xBF)
+                return i
+            i += 3
+        elif b >= 0xEE and b <= 0xEF
+            if not continuation(octets, i + 1, to, 2, 0x80, 0xBF)
+                return i
+            i += 3
+        elif b == 0xF0
+            // U+10000 is the lowest four-octet character, so this
+            // octet may not be below 0x90; 0x80 to 0x8F is an overlong
+            // three-octet form.
+            if not continuation(octets, i + 1, to, 1, 0x90, 0xBF)
+                return i
+            if not continuation(octets, i + 2, to, 2, 0x80, 0xBF)
+                return i
+            i += 4
+        elif b >= 0xF1 and b <= 0xF3
+            if not continuation(octets, i + 1, to, 3, 0x80, 0xBF)
+                return i
+            i += 4
+        elif b == 0xF4
+            // U+10FFFF is the highest, which caps this octet at 0x8F.
+            if not continuation(octets, i + 1, to, 1, 0x80, 0x8F)
+                return i
+            if not continuation(octets, i + 2, to, 2, 0x80, 0xBF)
+                return i
+            i += 4
+        else
+            // 0x80 to 0xC1 outside a sequence, and 0xF5 to 0xFF.
+            return i
+    -1
+
+// The octets of a message as plain `Int`s, which is the shape
+// `bytes.byte_list_to_str` reads.
+fn byte_ints(octets: [u8]) -> [Int]
+    list.map(octets, b => b as Int)
+
+// The RFC 3164 § 4.1 cap, which is the same number
+// `syslog3164.max_message_octets` answers.  It is repeated here
+// because `syslog3164` calls into this module and a `use` back the
+// other way is the cycle the compiler refuses.
+const RFC3164_MAX_MESSAGE_OCTETS = 1024
+
+// The RFC 5424 § 6.2 lengths of the four text header fields.
+const MAX_HOSTNAME_OCTETS = 255
+const MAX_APP_NAME_OCTETS = 48
+const MAX_PROCID_OCTETS = 128
+const MAX_MSGID_OCTETS = 32
+
+// One header field, against RFC 5424 § 6.2's length and § 6's
+// PRINTUSASCII rule.
+//
+// The offset in a `SyslogFieldNotPrintable` is counted within the
+// field: this check runs where a value is built, so there is no stream
+// for an offset into.
+fn check_field(field: Str, value: Str, max_octets: Int) -> ?SyslogError
+    let n = str.len(value)
+    if n > max_octets
+        return Some(SyslogFieldTooLong(field, n, max_octets))
+    var k = 0
+    while k < n
+        let b = char_at(value, k)
+        // PRINTUSASCII is %d33 to %d126, which leaves out the space by
+        // the range alone.
+        if b < 33 or b > 126
+            return Some(SyslogFieldNotPrintable(field, k))
+        k += 1
+    None
+
+// The first refusal of two, so a list of checks reads in order.
+fn first_of(a: ?SyslogError, b: ?SyslogError) -> ?SyslogError
+    match a
+        Some(e) => Some(e)
+        None    => b
+
+// Whether a message's application name is a TAG: RFC 3164 § 4.1.3
+// allows thirty-two alphanumeric characters and nothing else.
+fn check_tag(app_name: Str) -> ?SyslogError
+    let n = str.len(app_name)
+    if n > 32
+        return Some(SyslogBadTag(-1))
+    var k = 0
+    while k < n
+        let b = char_at(app_name, k)
+        let alphanumeric = is_digit(b) or is_letter(b)
+        if not alphanumeric
+            return Some(SyslogBadTag(k))
+        k += 1
+    None
+
+// How many octets a timestamp takes written as `Mmm dd hh:mm:ss`, plus
+// the space that separates it from the hostname, or nothing at all when
+// there is none.
+fn rfc3164_timestamp_octets(t: ?SyslogTimestamp) -> Int
+    match t
+        Some(_) => 16
+        None    => 0
+
+// What this message takes written as RFC 3164.
+//
+// The same arithmetic `syslog3164.format` writes, kept here because
+// `check` promises the 1024-octet total for a message whose own format
+// is RFC 3164.
+fn rfc3164_octets(m: SyslogMessage) -> Int
+    var total = 2 + digit_count(syslogpri.prival(m.pri))
+    total += rfc3164_timestamp_octets(m.timestamp)
+    if str.len(m.hostname) > 0
+        total += str.len(m.hostname) + 1
+    if str.len(m.app_name) > 0
+        total += str.len(m.app_name)
+        if str.len(m.procid) > 0
+            total += str.len(m.procid) + 2
+        total += 2
+    total + list.len(m.msg)
+
+// The RFC 5424 shape of `check`.
+//
+// Every answer is bound before it is passed on.  Written with the calls
+// nested — `first_of(check_field(…), first_of(…))` — the compiled leg
+// corrupts the value and a caller reading the fault crashes; the same
+// filing as `with_msg_text`'s workaround, named there.
+fn check_rfc5424(m: SyslogMessage) -> ?SyslogError
+    let host = check_field("HOSTNAME", m.hostname, MAX_HOSTNAME_OCTETS)
+    let app = check_field("APP-NAME", m.app_name, MAX_APP_NAME_OCTETS)
+    let procid = check_field("PROCID", m.procid, MAX_PROCID_OCTETS)
+    let msgid = check_field("MSGID", m.msgid, MAX_MSGID_OCTETS)
+    let text_fields = first_of(host, app)
+    let text_fields_2 = first_of(text_fields, procid)
+    let text_fields_3 = first_of(text_fields_2, msgid)
+    match text_fields_3
+        Some(e) => Some(e)
+        None    =>
+            let sd = m.structured_data
+            syslogsd.check(sd)
+
+// The RFC 3164 shape of `check`: § 4.1.3's TAG rule and § 4.1's cap.
+fn check_rfc3164(m: SyslogMessage) -> ?SyslogError
+    let tag = check_tag(m.app_name)
+    match tag
+        Some(e) => Some(e)
+        None    =>
+            let total = rfc3164_octets(m)
+            if total > RFC3164_MAX_MESSAGE_OCTETS
+                return Some(SyslogMessageTooLong(total, RFC3164_MAX_MESSAGE_OCTETS))
+            None
 
 // Which of the two syslog formats a message was read from.
 //
@@ -191,7 +420,24 @@ pub struct SyslogMessage
 //     println("${syslogpri.prival(m.pri)}")     // 14
 // ```
 pub fn message(pri: SyslogPri) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.message")
+    // Both empty lists are bound before the literal.  Written inline as
+    // `structured_data: [] as [SyslogSdElement]` the compiled leg
+    // stores the field empty, and every message of every program that
+    // opens with this constructor inherits it; see
+    // codegen-llvm/an-identity-cast-in-a-struct-literal-field-or-tuple-element-reads-as-empty.
+    let no_sd = [] as [SyslogSdElement]
+    let no_msg = [] as [u8]
+    SyslogMessage {
+        pri: pri,
+        format: SyslogFormatRfc5424,
+        timestamp: None,
+        hostname: "",
+        app_name: "",
+        procid: "",
+        msgid: "",
+        structured_data: no_sd,
+        msg: no_msg,
+        msg_utf8: false }
 
 // The message with this timestamp.
 //
@@ -206,7 +452,17 @@ pub fn message(pri: SyslogPri) -> SyslogMessage
 //         Err(e) => println(e.message())
 // ```
 pub fn with_timestamp(m: SyslogMessage, t: SyslogTimestamp) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_timestamp")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: Some(t),
+        hostname: m.hostname,
+        app_name: m.app_name,
+        procid: m.procid,
+        msgid: m.msgid,
+        structured_data: m.structured_data,
+        msg: m.msg,
+        msg_utf8: m.msg_utf8 }
 
 // The message with this hostname.
 //
@@ -223,7 +479,17 @@ pub fn with_timestamp(m: SyslogMessage, t: SyslogTimestamp) -> SyslogMessage
 //     println(syslogmsg.with_hostname(m, "mymachine.example.com").hostname)
 // ```
 pub fn with_hostname(m: SyslogMessage, hostname: Str) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_hostname")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: m.timestamp,
+        hostname: hostname,
+        app_name: m.app_name,
+        procid: m.procid,
+        msgid: m.msgid,
+        structured_data: m.structured_data,
+        msg: m.msg,
+        msg_utf8: m.msg_utf8 }
 
 // The message with this application name — RFC 3164's TAG, under RFC
 // 5424's name for it.
@@ -237,7 +503,17 @@ pub fn with_hostname(m: SyslogMessage, hostname: Str) -> SyslogMessage
 //     println(syslogmsg.with_app_name(m, "su").app_name)      // su
 // ```
 pub fn with_app_name(m: SyslogMessage, app_name: Str) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_app_name")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: m.timestamp,
+        hostname: m.hostname,
+        app_name: app_name,
+        procid: m.procid,
+        msgid: m.msgid,
+        structured_data: m.structured_data,
+        msg: m.msg,
+        msg_utf8: m.msg_utf8 }
 
 // The message with this process identifier.
 //
@@ -254,7 +530,17 @@ pub fn with_app_name(m: SyslogMessage, app_name: Str) -> SyslogMessage
 //     println(syslogmsg.with_procid(m, "1234").procid)        // 1234
 // ```
 pub fn with_procid(m: SyslogMessage, procid: Str) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_procid")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: m.timestamp,
+        hostname: m.hostname,
+        app_name: m.app_name,
+        procid: procid,
+        msgid: m.msgid,
+        structured_data: m.structured_data,
+        msg: m.msg,
+        msg_utf8: m.msg_utf8 }
 
 // The message with this message identifier.
 //
@@ -271,7 +557,17 @@ pub fn with_procid(m: SyslogMessage, procid: Str) -> SyslogMessage
 //     println(syslogmsg.with_msgid(m, "ID47").msgid)          // ID47
 // ```
 pub fn with_msgid(m: SyslogMessage, msgid: Str) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_msgid")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: m.timestamp,
+        hostname: m.hostname,
+        app_name: m.app_name,
+        procid: m.procid,
+        msgid: msgid,
+        structured_data: m.structured_data,
+        msg: m.msg,
+        msg_utf8: m.msg_utf8 }
 
 // The message with this structured data.
 //
@@ -291,7 +587,17 @@ pub fn with_msgid(m: SyslogMessage, msgid: Str) -> SyslogMessage
 //     println("${list.len(syslogmsg.with_structured_data(m, sd).structured_data)}")   // 1
 // ```
 pub fn with_structured_data(m: SyslogMessage, sd: [SyslogSdElement]) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_structured_data")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: m.timestamp,
+        hostname: m.hostname,
+        app_name: m.app_name,
+        procid: m.procid,
+        msgid: m.msgid,
+        structured_data: sd,
+        msg: m.msg,
+        msg_utf8: m.msg_utf8 }
 
 // The message with this text as its content, marked UTF-8.
 //
@@ -310,7 +616,17 @@ pub fn with_structured_data(m: SyslogMessage, sd: [SyslogSdElement]) -> SyslogMe
 //         None    => println("this cannot happen for text that went in as text")
 // ```
 pub fn with_msg_text(m: SyslogMessage, text: Str) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_msg_text")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: m.timestamp,
+        hostname: m.hostname,
+        app_name: m.app_name,
+        procid: m.procid,
+        msgid: m.msgid,
+        structured_data: m.structured_data,
+        msg: octets_of(text),
+        msg_utf8: true }
 
 // The message with these octets as its content, marked NOT UTF-8.
 //
@@ -328,7 +644,17 @@ pub fn with_msg_text(m: SyslogMessage, text: Str) -> SyslogMessage
 //     println("${list.len(syslogmsg.with_msg_bytes(m, [255 as u8]).msg)}")   // 1
 // ```
 pub fn with_msg_bytes(m: SyslogMessage, octets: [u8]) -> SyslogMessage
-    todo("syslog-nv.syslogmsg.with_msg_bytes")
+    SyslogMessage {
+        pri: m.pri,
+        format: m.format,
+        timestamp: m.timestamp,
+        hostname: m.hostname,
+        app_name: m.app_name,
+        procid: m.procid,
+        msgid: m.msgid,
+        structured_data: m.structured_data,
+        msg: octets,
+        msg_utf8: false }
 
 // The content as text, or `None` when it is not UTF-8.
 //
@@ -355,7 +681,14 @@ pub fn with_msg_bytes(m: SyslogMessage, octets: [u8]) -> SyslogMessage
 //         None    => println("not text")
 // ```
 pub fn msg_text(m: SyslogMessage) -> ?Str
-    todo("syslog-nv.syslogmsg.msg_text")
+    if not m.msg_utf8
+        return None
+    // Text that went in as text is already known to be text; a message
+    // that arrived claiming a byte order mark is not, and that is the
+    // case this has to decide.
+    if first_bad_utf8(m.msg, 0, list.len(m.msg)) >= 0
+        return None
+    Some(bytes.byte_list_to_str(byte_ints(m.msg)))
 
 // A timestamp from its parts, or a refusal.
 //
@@ -377,7 +710,33 @@ pub fn msg_text(m: SyslogMessage) -> ?Str
 // ```
 pub fn timestamp(year: ?Int, month: Int, day: Int, hour: Int, minute: Int, second: Int, micros: Int,
                  offset_minutes: ?Int) -> Result<SyslogTimestamp, SyslogError>
-    todo("syslog-nv.syslogmsg.timestamp")
+    // The fraction first: it is the one part RFC 5424 § 6.2.3.1 caps by
+    // DIGITS rather than by value, so a micros of 1000000 is not a
+    // second and a fraction of zero, it is seven digits and refused.
+    if micros < 0 or micros > 999999
+        return Err(SyslogTimestampTooPrecise(digit_count(micros)))
+    // A refusal about a value rather than a place carries no octet,
+    // which is the `-1` `syslogerror.offset_of` documents for a fault
+    // that is not positional.
+    if month < 1 or month > 12
+        return Err(SyslogBadTimestamp(-1, "a month between 1 and 12"))
+    if day < 1 or day > 31
+        return Err(SyslogBadTimestamp(-1, "a day of the month between 1 and 31"))
+    if hour < 0 or hour > 23
+        return Err(SyslogBadTimestamp(-1, "an hour between 0 and 23"))
+    if minute < 0 or minute > 59
+        return Err(SyslogBadTimestamp(-1, "a minute between 0 and 59"))
+    if second < 0 or second > 59
+        return Err(SyslogBadTimestamp(-1, "a second between 0 and 59, because RFC 5424 6.2.3 forbids leap seconds"))
+    Ok(SyslogTimestamp {
+        year: year,
+        month: month,
+        day: day,
+        hour: hour,
+        minute: minute,
+        second: second,
+        micros: micros,
+        offset_minutes: offset_minutes })
 
 // The same timestamp with a year and a zone offset supplied.
 //
@@ -406,7 +765,15 @@ pub fn timestamp(year: ?Int, month: Int, day: Int, hour: Int, minute: Int, secon
 //         Err(e) => println(e.message())
 // ```
 pub fn timestamp_resolved(t: SyslogTimestamp, year: Int, offset_minutes: Int) -> SyslogTimestamp
-    todo("syslog-nv.syslogmsg.timestamp_resolved")
+    SyslogTimestamp {
+        year: Some(year),
+        month: t.month,
+        day: t.day,
+        hour: t.hour,
+        minute: t.minute,
+        second: t.second,
+        micros: t.micros,
+        offset_minutes: Some(offset_minutes) }
 
 // Which format some octets are in, or `None` when they are neither.
 //
@@ -432,7 +799,22 @@ pub fn timestamp_resolved(t: SyslogTimestamp, year: Int, offset_minutes: Int) ->
 //         None                      => println("not syslog")
 // ```
 pub fn detect_format(octets: [u8]) -> ?SyslogFormat
-    todo("syslog-nv.syslogmsg.detect_format")
+    match syslogpri.parse_pri(octets)
+        Err(_)      => None
+        Ok((_, at)) =>
+            // RFC 5424 § 6.2.2: the VERSION, then the space after it.
+            // The space is what settles it — `<34>1` alone is a prefix
+            // of both.
+            if byte_at(octets, at) == '1' and byte_at(octets, at + 1) == ' '
+                return Some(SyslogFormatRfc5424)
+            // RFC 3164 § 4.1.2: a timestamp, whose first field is the
+            // three-letter month.  The SHAPE is enough here; whether it
+            // is one of the twelve is `syslog3164.parse_timestamp`'s
+            // question, and a collector that gets the dialect wrong
+            // still gets a refusal rather than a wrong reading.
+            if is_letter(byte_at(octets, at)) and is_letter(byte_at(octets, at + 1)) and is_letter(byte_at(octets, at + 2)) and byte_at(octets, at + 3) == ' '
+                return Some(SyslogFormatRfc3164)
+            None
 
 // The NILVALUE, which is `"-"`.
 //
@@ -450,7 +832,7 @@ pub fn detect_format(octets: [u8]) -> ?SyslogFormat
 //     println(syslogmsg.nilvalue())      // -
 // ```
 pub fn nilvalue() -> Str
-    todo("syslog-nv.syslogmsg.nilvalue")
+    "-"
 
 // The first thing that would stop this message being written in its
 // own format, or `None`.
@@ -480,4 +862,6 @@ pub fn nilvalue() -> Str
 //         None    => println("this message can be written")
 // ```
 pub fn check(m: SyslogMessage) -> ?SyslogError
-    todo("syslog-nv.syslogmsg.check")
+    match m.format
+        SyslogFormatRfc5424 => check_rfc5424(m)
+        SyslogFormatRfc3164 => check_rfc3164(m)

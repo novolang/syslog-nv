@@ -1,8 +1,6 @@
 // syslogsd.nv — structured data, and the three characters that have to
 // be escaped inside a parameter value.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHAT STRUCTURED DATA IS
 //
 // RFC 5424 § 6.3 adds one field to a syslog message that is not free
@@ -46,6 +44,41 @@
 // that rule, written once.
 
 use syslogerror
+
+// Whether a byte is an ASCII digit.
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// The byte at an offset, or -1 past the end.
+//
+// A reader in this package walks octets that arrived from a network,
+// so every one of them is bounds-checked and past the end is a value
+// rather than a panic.
+fn byte_at(octets: [u8], i: Int) -> Int
+    if i < 0 or i >= list.len(octets)
+        return -1
+    octets[i] as Int
+
+// The byte at an offset of a `Str`, or -1 past the end.
+fn char_at(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, -1)
+
+// Whether a byte can be part of an SD-NAME: printable US-ASCII, minus
+// the four characters the grammar keeps for itself.
+fn is_name_byte(b: Int) -> Bool
+    b >= 33 and b <= 126 and b != '=' and b != ']' and b != '"'
+
+// The octets from `from` up to but not including `to`, as a `Str`.
+//
+// Used for the SD-NAMEs, which are validated before this is called, so
+// what comes back is ASCII whatever the octets held.
+fn text_of(octets: [u8], from: Int, to: Int) -> Str
+    let sb = str.builder_new()
+    for k in from..to
+        str.builder_append_char(sb, octets[k] as Int)
+    let out = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    out
 
 // One `name="value"` pair inside a structured-data element.
 //
@@ -105,7 +138,7 @@ pub struct SyslogSdElement
 //     println(p.name)           // iut
 // ```
 pub fn param(name: Str, value: Str) -> SyslogSdParam
-    todo("syslog-nv.syslogsd.param")
+    SyslogSdParam { name: name, value: value }
 
 // An element from an SD-ID and its parameters.
 //
@@ -117,7 +150,7 @@ pub fn param(name: Str, value: Str) -> SyslogSdParam
 //     println("${list.len(e.params)}")   // 1
 // ```
 pub fn element(id: Str, params: [SyslogSdParam]) -> SyslogSdElement
-    todo("syslog-nv.syslogsd.element")
+    SyslogSdElement { id: id, params: params }
 
 // The value of the first parameter with this name, or `None`.
 //
@@ -136,7 +169,10 @@ pub fn element(id: Str, params: [SyslogSdParam]) -> SyslogSdElement
 //         None    => println("no such parameter")
 // ```
 pub fn value_of(element: SyslogSdElement, name: Str) -> ?Str
-    todo("syslog-nv.syslogsd.value_of")
+    for p in element.params
+        if p.name == name
+            return Some(p.value)
+    None
 
 // Every value with this name, in the order they were written.
 //
@@ -153,7 +189,11 @@ pub fn value_of(element: SyslogSdElement, name: Str) -> ?Str
 //     println("${list.len(langs)}")      // 1
 // ```
 pub fn values_of(element: SyslogSdElement, name: Str) -> [Str]
-    todo("syslog-nv.syslogsd.values_of")
+    var out = [] as [Str]
+    for p in element.params
+        if p.name == name
+            list.push(out, p.value)
+    out
 
 // The element with this SD-ID, or `None`.
 //
@@ -170,7 +210,10 @@ pub fn values_of(element: SyslogSdElement, name: Str) -> [Str]
 //         None    => println("no origin element")
 // ```
 pub fn element_of(sd: [SyslogSdElement], id: Str) -> ?SyslogSdElement
-    todo("syslog-nv.syslogsd.element_of")
+    for e in sd
+        if e.id == id
+            return Some(e)
+    None
 
 // A parameter value with the three characters RFC 5424 § 6.3.3 names
 // escaped: `"`, `\` and `]`, each preceded by a backslash.
@@ -188,7 +231,20 @@ pub fn element_of(sd: [SyslogSdElement], id: Str) -> ?SyslogSdElement
 //     println(syslogsd.escape_param_value("array[0]"))    // array[0\]
 // ```
 pub fn escape_param_value(value: Str) -> Str
-    todo("syslog-nv.syslogsd.escape_param_value")
+    let sb = str.builder_new()
+    var k = 0
+    let n = str.len(value)
+    while k < n
+        let b = char_at(value, k)
+        // The three of § 6.3.3, and nothing else: a newline, a tab and
+        // an octet above 126 go through as they are.
+        if b == '"' or b == '\\' or b == ']'
+            str.builder_append_char(sb, '\\')
+        str.builder_append_char(sb, b)
+        k += 1
+    let out = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    out
 
 // A parameter value with RFC 5424 § 6.3.3's escapes undone.
 //
@@ -205,7 +261,21 @@ pub fn escape_param_value(value: Str) -> Str
 //     println(syslogsd.unescape_param_value("C:\\temp"))   // C:\temp
 // ```
 pub fn unescape_param_value(value: Str) -> Str
-    todo("syslog-nv.syslogsd.unescape_param_value")
+    let sb = str.builder_new()
+    var k = 0
+    let n = str.len(value)
+    while k < n
+        let b = char_at(value, k)
+        let nxt = char_at(value, k + 1)
+        if b == '\\' and (nxt == '"' or nxt == '\\' or nxt == ']')
+            str.builder_append_char(sb, nxt)
+            k += 2
+        else
+            str.builder_append_char(sb, b)
+            k += 1
+    let out = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    out
 
 // Whether a string is an SD-NAME.
 //
@@ -224,7 +294,20 @@ pub fn unescape_param_value(value: Str) -> Str
 //     println("${bad}")                  // false
 // ```
 pub fn is_valid_sd_name(name: Str) -> Bool
-    todo("syslog-nv.syslogsd.is_valid_sd_name")
+    let n = str.len(name)
+    // One to thirty-two characters: an empty name and a 33-octet one
+    // are both out.
+    if n < 1 or n > 32
+        return false
+    var k = 0
+    while k < n
+        // PRINTUSASCII is %d33 to %d126, which leaves out the space by
+        // the range alone; `=`, `]` and `"` are inside it and are the
+        // three the grammar keeps for itself.
+        if not is_name_byte(char_at(name, k))
+            return false
+        k += 1
+    true
 
 // Whether this SD-ID is one of the three RFC 5424 § 6.3.2 registers.
 //
@@ -245,7 +328,11 @@ pub fn is_valid_sd_name(name: Str) -> Bool
 //     println("${invented}")             // false
 // ```
 pub fn is_registered_sd_id(id: Str) -> Bool
-    todo("syslog-nv.syslogsd.is_registered_sd_id")
+    if id == "timeQuality"
+        return true
+    if id == "origin"
+        return true
+    id == "meta"
 
 // The private enterprise number of an SD-ID written
 // `name@<number>`, or `None`.
@@ -264,7 +351,22 @@ pub fn is_registered_sd_id(id: Str) -> Bool
 //         None    => println("not a private SD-ID")
 // ```
 pub fn enterprise_number(id: Str) -> ?Int
-    todo("syslog-nv.syslogsd.enterprise_number")
+    match str.index(id, "@")
+        None     => None
+        Some(at) =>
+            let digits = str.slice(id, at + 1, str.len(id))
+            if str.is_empty(digits)
+                return None
+            var k = 0
+            var all_digits = true
+            while k < str.len(digits)
+                if not is_digit(char_at(digits, k))
+                    all_digits = false
+                k += 1
+            if all_digits
+                str.to_int(digits)
+            else
+                None
 
 // The first thing wrong with a whole structured-data field, or `None`.
 //
@@ -287,7 +389,24 @@ pub fn enterprise_number(id: Str) -> ?Int
 //         None    => println("this field is well formed")
 // ```
 pub fn check(sd: [SyslogSdElement]) -> ?SyslogError
-    todo("syslog-nv.syslogsd.check")
+    var seen = [] as [Str]
+    for e in sd
+        if not is_valid_sd_name(e.id)
+            return Some(SyslogSdNameInvalid(e.id))
+        // A name with no `@` in it belongs to IANA, and the only three
+        // IANA has registered are the three § 6.3.2 names.  A name
+        // with an `@` is private and is not checked further here:
+        // § 6.3.2 does not say the number after it has to be one, and
+        // `enterprise_number` is the question for a caller that cares.
+        if not str.contains(e.id, "@") and not is_registered_sd_id(e.id)
+            return Some(SyslogSdIdNotRegistered(e.id))
+        if list.contains(seen, e.id)
+            return Some(SyslogSdIdRepeated(e.id))
+        list.push(seen, e.id)
+        for p in e.params
+            if not is_valid_sd_name(p.name)
+                return Some(SyslogSdNameInvalid(p.name))
+    None
 
 // The structured data at the start of some octets, and how many octets
 // it took.
@@ -307,7 +426,91 @@ pub fn check(sd: [SyslogSdElement]) -> ?SyslogError
 //         Err(e)      => println(e.message())
 // ```
 pub fn parse(octets: [u8]) -> Result<([SyslogSdElement], Int), SyslogError>
-    todo("syslog-nv.syslogsd.parse")
+    let n = list.len(octets)
+    // The NILVALUE is one octet and the field is over.  It and the
+    // empty list are the same field written two ways, so this answers
+    // the same thing `format([])` writes.
+    if n > 0 and byte_at(octets, 0) == '-'
+        // Bound before the tuple: an inline `as [SyslogSdElement]` cast
+        // written as a tuple element is stored empty by the compiled
+        // leg, so the caller would parse "-" and find a one-element
+        // answer whose list is missing; the interpreter is correct, and
+        // the two legs must agree.  See
+        // codegen-llvm/an-identity-cast-in-a-struct-literal-field-or-tuple-element-reads-as-empty.
+        let no_sd = [] as [SyslogSdElement]
+        return Ok((no_sd, 1))
+    var elements = [] as [SyslogSdElement]
+    var i = 0
+    while i < n and byte_at(octets, i) == '['
+        i += 1
+        let id_start = i
+        while i < n and is_name_byte(byte_at(octets, i))
+            i += 1
+        if i == id_start
+            return Err(SyslogBadStructuredData(i, "an SD-ID"))
+        // Every `Str` this function builds is built after the last
+        // refusal that could abandon it, and the octets it spans are
+        // carried as indices until then.  A heap local that the
+        // successful path moves out is not dropped on an early
+        // `return Err`, and leaks once per call: see
+        // memory-perceus/a-heap-local-moved-out-on-the-fall-through-is-not-dropped-on-an-early-return.
+        // The field is no quieter for it — each refusal below names the
+        // same octet it named when the `Str`s were live.
+        let id_end = i
+        var params = [] as [SyslogSdParam]
+        var closed = false
+        while not closed
+            let b = byte_at(octets, i)
+            if b == ']'
+                i += 1
+                closed = true
+            elif b == ' '
+                i += 1
+                let name_start = i
+                while i < n and is_name_byte(byte_at(octets, i))
+                    i += 1
+                if i == name_start
+                    return Err(SyslogBadStructuredData(i, "a PARAM-NAME"))
+                let name_end = i
+                if byte_at(octets, i) != '='
+                    return Err(SyslogBadStructuredData(i, "= after PARAM-NAME"))
+                i += 1
+                if byte_at(octets, i) != '"'
+                    return Err(SyslogBadStructuredData(i, "quoted PARAM-VALUE"))
+                i += 1
+                // The end of the value is the first quote that is not
+                // escaped, so a backslash swallows the octet after it
+                // whether or not that octet is one of the three § 6.3.3
+                // escapes — the same rule `unescape_param_value` reads
+                // the value with.
+                let value_start = i
+                var j = i
+                var value_closed = false
+                while j < n and not value_closed
+                    let c = byte_at(octets, j)
+                    if c == '\\'
+                        j += 2
+                    elif c == '"'
+                        value_closed = true
+                    else
+                        j += 1
+                if not value_closed
+                    let end = if j > n
+                        n
+                    else
+                        j
+                    return Err(SyslogBadStructuredData(end, "a closing quote"))
+                let pname = text_of(octets, name_start, name_end)
+                let value = unescape_param_value(text_of(octets, value_start, j))
+                i = j + 1
+                list.push(params, SyslogSdParam { name: pname, value: value })
+            else
+                return Err(SyslogBadStructuredData(i, "\"]\""))
+        let id = text_of(octets, id_start, id_end)
+        list.push(elements, SyslogSdElement { id: id, params: params })
+    if list.len(elements) == 0
+        return Err(SyslogBadStructuredData(0, "`-` or `[`"))
+    Ok((elements, i))
 
 // A structured-data field written the way RFC 5424 § 6.3 writes it.
 //
@@ -326,4 +529,24 @@ pub fn parse(octets: [u8]) -> Result<([SyslogSdElement], Int), SyslogError>
 //         Err(e) => println(e.message())
 // ```
 pub fn format(sd: [SyslogSdElement]) -> Result<Str, SyslogError>
-    todo("syslog-nv.syslogsd.format")
+    match check(sd)
+        Some(e) => Err(e)
+        None    =>
+            // No elements is the NILVALUE.  The field is never
+            // omitted, so this is the only spelling of "none".
+            if list.len(sd) == 0
+                return Ok("-")
+            let sb = str.builder_new()
+            for e in sd
+                str.builder_append(sb, "[")
+                str.builder_append(sb, e.id)
+                for p in e.params
+                    str.builder_append(sb, " ")
+                    str.builder_append(sb, p.name)
+                    str.builder_append(sb, "=\"")
+                    str.builder_append(sb, escape_param_value(p.value))
+                    str.builder_append(sb, "\"")
+                str.builder_append(sb, "]")
+            let out = str.builder_to_str(sb)
+            str.builder_drop(sb)
+            Ok(out)

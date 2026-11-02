@@ -1,0 +1,336 @@
+// syslog5424_cover_tests.nv — the refusals and the writing paths the API
+// suite leaves open.
+//
+// Added while landing the package.  The API suite proves this module
+// reads RFC 5424 § 6.5's examples; a receiver is judged by the octets a
+// sender got wrong and by what it writes back, so every refusal of the
+// header reader, every refusal of the timestamp reader, and every part
+// of a written message is provoked here on its own.  Each refusal is
+// asserted at the octet of the WHOLE message it holds, which is the
+// counter `offset_of` hands a log.
+
+use std.test
+use syslog5424
+use syslogmsg
+use syslogpri
+use syslogsd
+use syslogerror
+
+fn octets_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+// The octet the reader refuses at, or -1 when it read the message.
+fn fault_at(wire: Str) -> Int
+    match syslog5424.parse(octets_of(wire))
+        Ok(_)  => -1
+        Err(e) => syslogerror.offset_of(e)
+
+// The octet the timestamp reader refuses at, or -1 when it read the text.
+fn stamp_fault_at(text: Str) -> Int
+    match syslog5424.parse_timestamp(text)
+        Ok(_)  => -1
+        Err(e) => syslogerror.offset_of(e)
+
+// A message of the shape this format writes, so that a case can vary the
+// one part it is about.
+fn message_with(host: Str, app: Str, stamp: ?SyslogTimestamp, sd: [SyslogSdElement], body: [u8],
+                utf8: Bool) -> SyslogMessage
+    SyslogMessage {
+        pri: syslogpri.pri(SyslogFacUser, SyslogSevNotice),
+        format: SyslogFormatRfc5424,
+        timestamp: stamp,
+        hostname: host,
+        app_name: app,
+        procid: "",
+        msgid: "",
+        structured_data: sd,
+        msg: body,
+        msg_utf8: utf8 }
+
+// A stamp of the shape § 6.2.3 writes, with every part settled by hand so
+// that a case can carry one part the builder would not have made.
+fn stamp(year: ?Int, micros: Int, offset: ?Int) -> SyslogTimestamp
+    SyslogTimestamp {
+        year: year, month: 10, day: 11, hour: 22, minute: 14, second: 15,
+        micros: micros, offset_minutes: offset }
+
+// The octets of a header, then the structured-data field, then the
+// content — the three parts a case about the MSG needs to place.
+fn wire(header: Str, sd: Str, body: Str) -> [u8]
+    octets_of(header + " " + sd + " " + body)
+
+@test
+fn test_the_header_reader_refuses_a_field_that_is_not_there() [io]
+    test.case("an empty HOSTNAME field, which § 6.2 gives no spelling")
+    // § 6.2.4 gives every field a minimum length of one: the NILVALUE is
+    // `-`, and two spaces in a row are a field that is not there.
+    match syslog5424.parse(octets_of("<13>1 -  - - - -"))
+        Ok(_)  => test.fail("that header has an empty field in it")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "field_empty")
+            test.assert(str.contains(e.message(), "HOSTNAME"))
+
+    test.case("a PRI that is not one at all")
+    // The reader of a header is reached through the priority, so octets
+    // with no priority in front of them are refused before anything else
+    // is read.
+    match syslog5424.parse(octets_of("not a syslog message"))
+        Ok(_)  => test.fail("that is not a 5424 message")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "bad_pri")
+            test.assert(syslogerror.offset_of(e) == 0)
+
+@test
+fn test_a_timestamp_that_is_not_one_is_refused_where_the_message_has_it() [io]
+    // The TIMESTAMP is the sixth field, so a fault inside it is reported
+    // at the octet of the message a person can find in a packet
+    // capture — not at an octet of the field.
+    test.case("a FULL-DATE whose month is not two digits")
+    let where = str.len("<34>1 ")
+    test.assert(fault_at("<34>1 2026-1x-11T22:14:15Z - - - -") == where)
+
+    test.case("a FULL-TIME whose hour is not two digits")
+    test.assert(fault_at("<34>1 2026-10-11T2x:14:15Z - - - -") == where + 11)
+
+    test.case("an eight-digit fraction, which § 6.2.3.1 caps at six")
+    // The fault is about the fraction's DIGIT count and names it, so it
+    // carries no octet: `-1` is the offset of a fault that is not
+    // positional.
+    match syslog5424.parse(octets_of("<34>1 2026-10-11T22:14:15.000000003Z - - - -"))
+        Ok(_)                                  => test.fail("nine digits are over the cap")
+        Err(SyslogTimestampTooPrecise(digits)) => test.assert(digits == 9)
+        Err(_)                                 => test.fail("wrong reason for too much precision")
+
+@test
+fn test_the_structured_data_field_is_looked_for_where_the_message_puts_it() [io]
+    test.case("a field that stops in the middle of an element")
+    // The structured data starts after the fifth header field's space,
+    // and a fault in it is counted from the first octet of the whole
+    // message — which is what this asserts: the same offset the
+    // element's own reader names, moved by where the field sits.
+    let field_at = str.len("<34>1 2026-10-11T22:14:15Z - - - - ")
+    let octets = octets_of("<34>1 2026-10-11T22:14:15Z - - - - [meta")
+    match syslog5424.parse(octets)
+        Ok(_)                               => test.fail("that element is never closed")
+        Err(SyslogBadStructuredData(at, _)) => test.assert(at == field_at + 5)
+        Err(_)                              => test.fail("that is a structured-data fault")
+
+    test.case("and octets after the closing bracket that are not a space")
+    // § 6.1: the MSG follows the structured data only after a space, so
+    // `]x` is not a message with a one-octet MSG.
+    let trailing = "<34>1 2026-10-11T22:14:15Z - - - - [meta lang=\"en\"]x"
+    test.assert(fault_at(trailing) == str.len("<34>1 2026-10-11T22:14:15Z - - - - [meta lang=\"en\"]"))
+
+@test
+fn test_a_timestamp_reader_refuses_each_part_that_is_out_of_shape() [io]
+    // § 6.2.3's FULL-DATE, FULL-TIME and TIME-OFFSET, each one wrong in
+    // the way a sender gets it wrong, each answered at its own octet.
+    test.case("a date that is not four-two-two digits")
+    match syslog5424.parse_timestamp("2026-1x-11T22:14:15Z")
+        Ok(_)  => test.fail("that is not a FULL-DATE")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "bad_timestamp")
+            test.assert(stamp_fault_at("2026-1x-11T22:14:15Z") == 0)
+
+    test.case("a date whose separators are not dashes")
+    // `fixed_int` reads the digits it was told to read and then looks
+    // for the separator it was told to expect; a date that puts
+    // something else there is the whole FULL-DATE's fault.
+    test.assert(stamp_fault_at("2026x10-11T22:14:15Z") == 0)
+
+    test.case("a time whose separators are not colons")
+    test.assert(stamp_fault_at("2026-10-11T22x14:15Z") == 11)
+
+    test.case("a time that is not two-two-two digits")
+    test.assert(stamp_fault_at("2026-10-11T2x:14:15Z") == 11)
+
+    test.case("a full stop with no fraction after it")
+    // The refusal names the octet a DIGIT was expected at, which is
+    // one past the full stop.
+    test.assert(stamp_fault_at("2026-10-11T22:14:15.Z") == 20)
+
+    test.case("an offset whose hours are not two digits")
+    test.assert(stamp_fault_at("2026-10-11T22:14:15+2x:00") == 19)
+
+    test.case("an offset further from UTC than 23:59")
+    test.assert(stamp_fault_at("2026-10-11T22:14:15+24:00") == 19)
+
+    test.case("an offset that is neither Z nor a sign")
+    test.assert(stamp_fault_at("2026-10-11T22:14:15x") == 19)
+
+    test.case("and octets after the offset, which § 6.2.3 has no room for")
+    test.assert(stamp_fault_at("2026-10-11T22:14:15Zz") == 20)
+
+    test.case("while an offset east of UTC is an offset and not a fault")
+    match syslog5424.parse_timestamp("2026-10-11T22:14:15+07:00")
+        Err(_) => test.fail("+07:00 is how a third of the world writes it")
+        Ok(t)  =>
+            match t.offset_minutes
+                None    => test.fail("a sign and two halves are an offset")
+                Some(o) => test.assert(o == 420)
+
+@test
+fn test_a_written_message_says_where_its_content_begins() [io]
+    let no_stamp = None as ?SyslogTimestamp
+    let no_sd = [] as [SyslogSdElement]
+
+    test.case("a message of a priority and nothing else")
+    // The smallest message there is: every field the NILVALUE, no
+    // structured data, and no MSG — so there is no separator either.
+    let empty = message_with("-", "-", no_stamp, no_sd, [] as [u8], false)
+    match syslog5424.format(empty)
+        Err(_)     => test.fail("every field is the NILVALUE")
+        Ok(octets) =>
+            test.assert(octets == octets_of("<13>1 - - - - - -"))
+            // And it reads back as the message it was written from.  A
+            // header with no MSG at all is a header whose fields the
+            // reader must not run off the end of looking for one.
+            match syslog5424.parse(octets)
+                Err(_) => test.fail("this package reads what it writes")
+                Ok(m)  =>
+                    test.assert(list.len(m.msg) == 0)
+                    test.assert(not m.msg_utf8)
+
+    test.case("a MSG that begins with the byte order mark")
+    // § 6.4: the mark is a declaration and not content, so it is
+    // written from `msg_utf8` and never from the message's own octets.
+    let utf8 = message_with("-", "-", no_stamp, no_sd, octets_of("ok"), true)
+    match syslog5424.format(utf8)
+        Err(_)     => test.fail("the byte order mark is a part of this format")
+        Ok(octets) =>
+            let mark = [0xEF as u8, 0xBB as u8, 0xBF as u8]
+            let head = octets_of("<13>1 - - - - - - ")
+            test.assert(list.len(octets) == list.len(head) + 3 + 2)
+            test.assert(octets == list.concat(head, list.concat(mark, octets_of("ok"))))
+            match syslog5424.parse(octets)
+                Err(_) => test.fail("this package reads what it writes")
+                Ok(m)  =>
+                    test.assert(m.msg_utf8)
+                    test.assert(m.msg == octets_of("ok"))
+
+    test.case("and a mark that is only half arrived")
+    // Two octets of `EF BB BF` are not a mark: the MSG is the octets
+    // that came, and a reader that looked one past the end of its
+    // buffer would be reading somebody else's memory.
+    let partial = list.concat(octets_of("<13>1 - - - - - - "), [0xEF as u8, 0xBB as u8])
+    match syslog5424.parse(partial)
+        Err(_) => test.fail("a MSG of two octets is a MSG")
+        Ok(m)  =>
+            test.assert(not m.msg_utf8)
+            test.assert(list.len(m.msg) == 2)
+
+    test.case("while a message with no MSG has no separator")
+    let body = [] as [u8]
+    let bare = message_with("-", "-", no_stamp, no_sd, body, true)
+    match syslog5424.format(bare)
+        Err(_)     => test.fail("that message is legal")
+        Ok(octets) => test.assert(octets == octets_of("<13>1 - - - - - -"))
+
+@test
+fn test_the_writer_refuses_what_the_checker_refuses() [io]
+    let no_sd = [] as [SyslogSdElement]
+    let no_stamp = None as ?SyslogTimestamp
+
+    test.case("a HOSTNAME with a space in it")
+    // § 6.2 separates the fields by single spaces, so a space inside one
+    // shifts every field after it by an octet — which is a message no
+    // receiver reads back the way it was written.
+    let spaced = message_with("my machine", "app", no_stamp, no_sd, octets_of("x"), false)
+    match syslog5424.format(spaced)
+        Ok(_)  => test.fail("a space in a field shifts the ones after it")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "field_not_printable")
+            test.assert(str.contains(e.message(), "HOSTNAME"))
+
+    test.case("a stamp whose own parts are out of range, which the builder settles")
+    // `format_timestamp` documents what is left to it: the year's four
+    // digits, the offset's distance from UTC and the fraction's DIGIT
+    // count.  A month is not one of them — `syslogmsg.timestamp` is
+    // where a caller's parts are settled — so a stamp built by hand with
+    // a thirteenth month is written as the digits it holds.
+    let crooked = message_with("-", "app", Some(stamp(Some(2026), 0, Some(0))), no_sd,
+                               octets_of("x"), false)
+    match syslog5424.format(crooked)
+        Err(_) => test.fail("that timestamp is one this syntax writes")
+        Ok(_)  => test.assert(true)
+
+    let bad_stamp = SyslogTimestamp {
+        year: Some(2026), month: 13, day: 11, hour: 22, minute: 14, second: 15,
+        micros: 0, offset_minutes: Some(0) }
+    let unwritable = message_with("-", "app", Some(bad_stamp), no_sd, octets_of("x"), false)
+    match syslog5424.format(unwritable)
+        Err(_)      => test.fail("a part out of range is the builder's refusal, not this one")
+        Ok(written) => test.assert(written == octets_of("<13>1 2026-13-11T22:14:15Z - app - - - x"))
+
+    test.case("while a year outside four digits is refused here, which is the year's own rule")
+    let far = message_with("-", "app", Some(stamp(Some(10000), 0, Some(0))), no_sd,
+                           octets_of("x"), false)
+    match syslog5424.format(far)
+        Ok(_)  => test.fail("§ 6.2.3's FULL-DATE is exactly four digits")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "bad_timestamp")
+            test.assert(syslogerror.offset_of(e) == -1)
+
+@test
+fn test_a_timestamp_that_cannot_be_written_is_refused_part_by_part() [io]
+    // The parts of a timestamp are settled where a caller builds it, so
+    // these are values a store or a hand written test hands over.  Each
+    // is a refusal naming the part, not a guess.
+    test.case("a year outside four digits")
+    match syslog5424.format_timestamp(stamp(Some(10000), 0, Some(0)))
+        Ok(_)  => test.fail("§ 6.2.3's FULL-DATE is exactly four digits")
+        Err(e) => test.assert(syslogerror.code(e) == "bad_timestamp")
+
+    test.case("no offset at all, which is an RFC 3164 timestamp")
+    match syslog5424.format_timestamp(stamp(Some(2026), 0, None))
+        Ok(_)  => test.fail("§ 6.2.3 always carries a zone offset")
+        Err(e) =>
+            test.assert(syslogerror.code(e) == "timestamp_incomplete")
+            test.assert(str.contains(e.message(), "offset"))
+
+    test.case("an offset further from UTC than 23:59")
+    match syslog5424.format_timestamp(stamp(Some(2026), 0, Some(1440)))
+        Ok(_)  => test.fail("a day is not an offset")
+        Err(e) => test.assert(syslogerror.code(e) == "bad_timestamp")
+
+    test.case("a fraction below zero")
+    match syslog5424.format_timestamp(stamp(Some(2026), -1, Some(0)))
+        Ok(_)  => test.fail("a fraction of a second is not negative")
+        Err(e) => test.assert(syslogerror.code(e) == "bad_timestamp")
+
+    test.case("a fraction of more than six digits, naming how many")
+    match syslog5424.format_timestamp(stamp(Some(2026), 1000000, Some(0)))
+        Ok(_)                                  => test.fail("a million microseconds is seven digits")
+        Err(SyslogTimestampTooPrecise(digits)) => test.assert(digits == 7)
+        Err(_)                                 => test.fail("wrong reason for too much precision")
+
+    test.case("while both sides of UTC are written with their sign")
+    // § 6.2.3's TIME-OFFSET is a sign and two `HH:MM` halves; only zero
+    // is written `Z`, because that is the same instant in one octet.
+    match syslog5424.format_timestamp(stamp(Some(2026), 0, Some(330)))
+        Err(_)   => test.fail("+05:30 is an offset")
+        Ok(text) => test.assert(str.contains(text, "+05:30"))
+
+    match syslog5424.format_timestamp(stamp(Some(2026), 0, Some(-330)))
+        Err(_)   => test.fail("-05:30 is an offset")
+        Ok(text) => test.assert(str.contains(text, "-05:30"))
+
+    match syslog5424.format_timestamp(stamp(Some(2026), 0, Some(0)))
+        Err(_)   => test.fail("zero is an offset too")
+        Ok(text) => test.assert(str.contains(text, "Z"))
+
+@test
+fn test_a_5424_message_carries_its_structured_data_back_through_the_wire() [io]
+    // The reader hands the structured data to `syslogsd` and the writer
+    // takes it back from there, so the field a message was read from is
+    // the field it is written with — element for element, with the
+    // private SD-ID of § 6.5's own example.
+    let octets = wire("<34>1 2026-10-11T22:14:15Z mymachine app 1 -",
+                      "[exampleSDID@32473 iut=\"3\"]", "hello")
+    match syslog5424.parse(octets)
+        Err(_) => test.fail("§ 6.5's own private SD-ID and a MSG")
+        Ok(m)  =>
+            test.assert(list.len(m.structured_data) == 1)
+            match syslog5424.format(m)
+                Err(_)      => test.fail("that message is one this package wrote")
+                Ok(written) => test.assert(written == octets)

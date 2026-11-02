@@ -9,12 +9,6 @@ messages are separated when they are sent over a stream. This package
 reads and writes both formats, and cuts a stream into messages, in
 novo-lang. It opens no socket and reads no clock.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What syslog is
 
 A syslog message is a short record of one event. It begins with a
@@ -107,10 +101,9 @@ fn main() [io]
                             None       => println("the content is not text")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: syslog-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The suites under
+`tests/` are the specification: each one asserts what the RFCs' own
+sentences say, and the bodies are fitted to them and not the reverse.
 
 ## What the package contains
 
@@ -288,6 +281,11 @@ novo test tests/syslogframe_tests.nv    # the two framings, and the two kinds of
 novo test tests/syslogcover_tests.nv    # the message value, and every public function
 ```
 
+Those six are the specification. The `_cover_tests` and `_edge_tests`
+suites beside them are the paths an example message does not reach —
+every refusal of every reader, every arm of every table, and the
+reader's boundaries — one file per module.
+
 The normative sources are RFC 5424 for the current format, RFC 3164 for
 the BSD format and RFC 6587 for the framing. The fixtures are the
 example messages those documents publish: RFC 5424 section 6.5, RFC
@@ -306,34 +304,8 @@ priority 13, that a message containing a line feed cannot be
 line-framed, and that the end of a connection is a message under one
 framing and a fault under the other.
 
-The tests compile today and fail at run, each on the
-`not implemented: syslog-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `SyslogError`, `SyslogPri`, `SyslogFacility`, `SyslogSeverity` and the other types | the types are declared |
-| `syslogerror.is_framing_fault`, `.offset_of`, `.code`, `SyslogError.message` | no |
-| `syslogpri.pri`, `.prival`, `.from_prival`, `.parse_pri`, `.format_pri` | no |
-| `syslogpri.facility_number`, `.severity_number`, `.facility_from_number`, `.severity_from_number` | no |
-| `syslogpri.facility_description`, `.severity_name`, `.severity_from_name`, `.is_at_least_as_severe` | no |
-| `syslogsd.param`, `.element`, `.value_of`, `.values_of`, `.element_of` | no |
-| `syslogsd.escape_param_value`, `.unescape_param_value`, `.is_valid_sd_name` | no |
-| `syslogsd.is_registered_sd_id`, `.enterprise_number`, `.check`, `.parse`, `.format` | no |
-| `syslogmsg.message` and the eight `with_` builders | no |
-| `syslogmsg.msg_text`, `.timestamp`, `.timestamp_resolved`, `.detect_format`, `.nilvalue`, `.check` | no |
-| `syslog5424.parse`, `.parse_header`, `.format` | no |
-| `syslog5424.parse_timestamp`, `.format_timestamp`, `.field_limits`, `.is_printable_ascii` | no |
-| `syslog5424.bom`, `.version`, `.minimum_supported_octets`, `.recommended_supported_octets` | no |
-| `syslog3164.parse`, `.parse_relaxed`, `.format`, `.default_pri`, `.split_tag` | no |
-| `syslog3164.parse_timestamp`, `.format_timestamp`, `.month_abbreviations` | no |
-| `syslog3164.max_message_octets`, `.max_tag_chars` | no |
-| `syslogframe.reader`, `.feed`, `.take`, `.drain`, `.finish` | no |
-| `syslogframe.default_limits`, `.small_limits`, `.pending_len`, `.offset`, `.framing_of` | no |
-| `syslogframe.detect_framing`, `.trailer_octets`, `.frame` | no |
+The six API suites under `tests/` are the specification, one module per
+file.
 
 ## Licence
 
