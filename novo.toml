@@ -31,7 +31,7 @@ category    = "networking"
 tags        = ["syslog", "rfc-5424", "rfc-3164", "rfc-6587", "logging", "structured-data", "framing", "sans-io", "codec"]
 repository  = "https://github.com/novolang/syslog-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.20.2"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

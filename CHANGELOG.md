@@ -139,6 +139,8 @@ happened to.
   success path moves out is not dropped on an early `return Err`).
   Both are revertible when those filings close.
 
+This release requires novo 0.23.0 or later.
+
 ## [0.0.1] — 2026-09-17
 
 **The interface, published before anyone implements it.** Every public
